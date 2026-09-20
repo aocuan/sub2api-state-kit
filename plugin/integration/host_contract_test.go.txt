@@ -1,0 +1,373 @@
+//go:build statekit_host_contract
+
+// This file is copied temporarily into the official v0.2.7 host's service package
+// by run_host_contract.py. It is not a patch to the host and is excluded from the
+// plugin module's normal tests. All identities and upstreams below are synthetic.
+package service
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	pluginv1 "github.com/Wei-Shaw/sub2api/pkg/pluginapi/v1"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const stateKitContractPluginID = "io.github.wangyunjeff.sub2api-state-kit"
+const stateKitContractKeyID = "state-kit-release-v1"
+
+type stateKitContractDirectory struct {
+	lists    atomic.Int64
+	resolves atomic.Int64
+}
+
+type stateKitContractKV struct {
+	PluginKVStore
+	gets atomic.Int64
+}
+
+func (s *stateKitContractKV) Get(ctx context.Context, pluginKey, namespace, key string) ([]byte, bool, error) {
+	s.gets.Add(1)
+	return s.PluginKVStore.Get(ctx, pluginKey, namespace, key)
+}
+
+func (d *stateKitContractDirectory) ListPluginAccounts(_ context.Context, platform, accountType string) ([]int64, error) {
+	d.lists.Add(1)
+	if (platform != "" && platform != PlatformOpenAI) || (accountType != "" && accountType != AccountTypeOAuth) {
+		return nil, nil
+	}
+	return []int64{42, 84}, nil
+}
+
+func (d *stateKitContractDirectory) ResolvePluginOutboundIdentity(_ context.Context, id int64) (*PluginOutboundIdentity, error) {
+	d.resolves.Add(1)
+	if id != 42 && id != 84 {
+		return nil, nil
+	}
+	return &PluginOutboundIdentity{
+		AccountID: id, Platform: PlatformOpenAI, AccountType: AccountTypeOAuth,
+		Token:   "synthetic-host-contract-token",
+		Headers: http.Header{"Chatgpt-Account-Id": []string{"synthetic-host-contract-account"}},
+	}, nil
+}
+
+func stateKitContractPackage(t *testing.T) ([]byte, string) {
+	t.Helper()
+	path := os.Getenv("STATE_KIT_TEST_PACKAGE")
+	key := strings.TrimSpace(os.Getenv("STATE_KIT_TEST_PUBLIC_KEY"))
+	if path == "" || key == "" {
+		t.Skip("set STATE_KIT_TEST_PACKAGE and STATE_KIT_TEST_PUBLIC_KEY")
+	}
+	rawKey, err := base64.StdEncoding.DecodeString(key)
+	require.NoError(t, err)
+	require.Len(t, rawKey, 32)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return data, key
+}
+
+func stateKitContractInstaller(t *testing.T, publicKey string) *PluginPackageInstaller {
+	t.Helper()
+	cfg := testPluginConfig(t.TempDir(), false)
+	cfg.Plugins.MaxUploadBytes = 128 << 20
+	cfg.Plugins.MaxUncompressedBytes = 256 << 20
+	if publicKey != "" {
+		cfg.Plugins.TrustedPublishers[stateKitContractKeyID] = publicKey
+	}
+	return NewPluginPackageInstaller(cfg, PluginHostInfo{Version: "0.2.7", BuildType: "release"})
+}
+
+func stateKitContractRewriteZIP(t *testing.T, raw []byte, filename string, edit func([]byte) []byte) []byte {
+	t.Helper()
+	zr, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
+	require.NoError(t, err)
+	var out bytes.Buffer
+	zw := zip.NewWriter(&out)
+	changed := false
+	for _, file := range zr.File {
+		r, err := file.Open()
+		require.NoError(t, err)
+		body, err := io.ReadAll(r)
+		require.NoError(t, err)
+		require.NoError(t, r.Close())
+		if file.Name == filename {
+			body = edit(body)
+			changed = true
+		}
+		header := file.FileHeader
+		w, err := zw.CreateHeader(&header)
+		require.NoError(t, err)
+		_, err = w.Write(body)
+		require.NoError(t, err)
+	}
+	require.True(t, changed, "mutation target must exist")
+	require.NoError(t, zw.Close())
+	return out.Bytes()
+}
+
+func TestStateKitOfficialHostPackageTrust(t *testing.T) {
+	raw, key := stateKitContractPackage(t)
+	t.Run("signed_install_is_disabled_and_compatible", func(t *testing.T) {
+		got, err := stateKitContractInstaller(t, key).Install(context.Background(), bytes.NewReader(raw), nil)
+		require.NoError(t, err)
+		assert.Equal(t, stateKitContractPluginID, got.PluginKey)
+		assert.Equal(t, "0.3.3", got.Version)
+		assert.Equal(t, PluginSignatureTrusted, got.SignatureStatus)
+		assert.Equal(t, PluginStateDisabled, got.State)
+		assert.True(t, got.Compatibility.Compatible)
+		assert.True(t, got.Compatibility.Tested)
+		assert.FileExists(t, got.BinaryPath)
+		assert.FileExists(t, filepath.Join(got.InstallPath, "ui", "index.html"))
+	})
+	t.Run("untrusted_publisher_is_rejected", func(t *testing.T) {
+		_, err := stateKitContractInstaller(t, "").Install(context.Background(), bytes.NewReader(raw), nil)
+		require.ErrorContains(t, err, "不受信任")
+	})
+	t.Run("tampered_payload_is_rejected", func(t *testing.T) {
+		mutated := stateKitContractRewriteZIP(t, raw, "ui/index.html", func(body []byte) []byte { return append(body, []byte("<!-- tampered -->")...) })
+		_, err := stateKitContractInstaller(t, key).Install(context.Background(), bytes.NewReader(mutated), nil)
+		require.ErrorContains(t, err, "哈希不匹配")
+	})
+	t.Run("tampered_signature_is_rejected", func(t *testing.T) {
+		mutated := stateKitContractRewriteZIP(t, raw, "signature.json", func(body []byte) []byte {
+			var signature PluginSignature
+			require.NoError(t, json.Unmarshal(body, &signature))
+			signature.Signature = base64.StdEncoding.EncodeToString(make([]byte, 64))
+			encoded, err := json.Marshal(signature)
+			require.NoError(t, err)
+			return encoded
+		})
+		_, err := stateKitContractInstaller(t, key).Install(context.Background(), bytes.NewReader(mutated), nil)
+		require.ErrorContains(t, err, "签名校验失败")
+	})
+}
+
+func stateKitContractStart(t *testing.T, installation *PluginInstallation, host pluginv1.HostServiceServer) *pluginRuntime {
+	t.Helper()
+	// A short socket path is necessary on macOS, whose unix path limit is 104 bytes.
+	socketDir, err := os.MkdirTemp("", "sk-")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+	runtime, err := startPluginRuntime(context.Background(), installation, 15*time.Second, socketDir, host)
+	require.NoError(t, err)
+	t.Cleanup(runtime.kill)
+	return runtime
+}
+
+func stateKitContractRoundTrip(t *testing.T, runtime *pluginRuntime, req *http.Request) *http.Response {
+	t.Helper()
+	account := &Account{ID: 42, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1}
+	require.True(t, runtime.beginRequest())
+	response, err := runtime.roundTrip(req.Context(), req, "", account)
+	if err != nil {
+		runtime.finishRequest()
+	}
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = response.Body.Close() })
+	return response
+}
+
+func TestStateKitOfficialHostRuntime(t *testing.T) {
+	raw, key := stateKitContractPackage(t)
+	installation, err := stateKitContractInstaller(t, key).Install(context.Background(), bytes.NewReader(raw), nil)
+	require.NoError(t, err)
+	directory := &stateKitContractDirectory{}
+	store := &stateKitContractKV{PluginKVStore: newFakePluginKVStore()}
+	host := newPluginHostServiceServer(stateKitContractPluginID, store, directory)
+	runtime := stateKitContractStart(t, installation, host)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	normalized, err := runtime.validateAndApplyNormalizedConfig(ctx, []byte(`{}`))
+	require.NoError(t, err)
+	var defaults map[string]any
+	require.NoError(t, json.Unmarshal(normalized, &defaults))
+	assert.Equal(t, false, defaults["enabled"], "fresh plugin must not enable STATE")
+	assert.Empty(t, defaults["accounts"], "fresh plugin must not opt accounts in")
+	health, err := runtime.status(ctx)
+	require.NoError(t, err)
+	require.True(t, health.Healthy)
+	require.True(t, json.Valid([]byte(health.StatusJson)))
+	var initialStatus struct {
+		HostReady bool `json:"host_ready"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(health.StatusJson), &initialStatus))
+	assert.True(t, initialStatus.HostReady, "plugin must connect to the host's reverse gRPC service")
+	assert.NotContains(t, health.StatusJson, "synthetic-host-contract-token")
+	assert.NotContains(t, health.StatusJson, "synthetic-host-contract-account")
+
+	t.Run("binary_body_headers_and_status_preserved", func(t *testing.T) {
+		payload := bytes.Repeat([]byte{0, 1, 2, 255, 128, 13, 10}, 10000)
+		answer := []byte{255, 0, 10, 128, 'o', 'k'}
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			got, readErr := io.ReadAll(req.Body)
+			assert.NoError(t, readErr)
+			assert.Equal(t, payload, got)
+			assert.Equal(t, int64(len(payload)), req.ContentLength)
+			assert.Equal(t, []string{"one", "two"}, req.Header.Values("X-Contract-Multi"))
+			assert.Equal(t, "client-existing-state", req.Header.Get("X-Codex-Turn-State"), "default-off preserves caller headers")
+			w.Header().Add("X-Contract-Reply", "alpha")
+			w.Header().Add("X-Contract-Reply", "beta")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write(answer)
+		}))
+		defer upstream.Close()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstream.URL+"/binary", bytes.NewReader(payload))
+		require.NoError(t, err)
+		req.Header.Add("X-Contract-Multi", "one")
+		req.Header.Add("X-Contract-Multi", "two")
+		req.Header.Set("X-Codex-Turn-State", "client-existing-state")
+		resp := stateKitContractRoundTrip(t, runtime, req)
+		got, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusCreated, resp.StatusCode)
+		assert.Equal(t, int64(len(answer)), resp.ContentLength)
+		assert.Equal(t, []string{"alpha", "beta"}, resp.Header.Values("X-Contract-Reply"))
+		assert.Equal(t, answer, got)
+		require.NoError(t, resp.Body.Close())
+	})
+
+	t.Run("sse_is_streamed_before_response_completion", func(t *testing.T) {
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		unblock := func() { releaseOnce.Do(func() { close(release) }) }
+		defer unblock()
+		first := "data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-test\"}}\n\n"
+		last := "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-test\"}}\n\n"
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, first)
+			w.(http.Flusher).Flush()
+			select {
+			case <-release:
+			case <-req.Context().Done():
+				return
+			}
+			_, _ = io.WriteString(w, last)
+		}))
+		defer upstream.Close()
+		defer unblock()
+		streamCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, upstream.URL+"/stream", nil)
+		require.NoError(t, err)
+		resp := stateKitContractRoundTrip(t, runtime, req)
+		part := make([]byte, len(first))
+		_, err = io.ReadFull(resp.Body, part)
+		require.NoError(t, err, "first SSE event must arrive while upstream waits")
+		assert.Equal(t, first, string(part))
+		unblock()
+		rest, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, last, string(rest))
+		require.NoError(t, resp.Body.Close())
+	})
+
+	t.Run("valid_account_config_and_unknown_field_rejection", func(t *testing.T) {
+		valid := []byte(`{"enabled":false,"accounts":[{"account_id":42,"enabled":true,"plan":"pro"},{"account_id":84,"enabled":false,"plan":"team"}]}`)
+		require.NoError(t, runtime.validateAndApplyConfig(ctx, valid))
+		err := runtime.validateAndApplyConfig(ctx, []byte(`{"not_a_supported_field":true}`))
+		require.Error(t, err)
+	})
+
+	t.Run("cancelled_stream_closes_upstream", func(t *testing.T) {
+		closed := make(chan struct{})
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			defer close(closed)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: first\n\n")
+			w.(http.Flusher).Flush()
+			<-req.Context().Done()
+		}))
+		defer upstream.Close()
+		streamCtx, stop := context.WithCancel(context.Background())
+		defer stop()
+		req, err := http.NewRequestWithContext(streamCtx, http.MethodGet, upstream.URL+"/cancel", nil)
+		require.NoError(t, err)
+		resp := stateKitContractRoundTrip(t, runtime, req)
+		first := make([]byte, len("data: first\n\n"))
+		_, err = io.ReadFull(resp.Body, first)
+		require.NoError(t, err)
+		stop()
+		_, err = io.ReadAll(resp.Body)
+		require.Error(t, err)
+		require.NoError(t, resp.Body.Close())
+		select {
+		case <-closed:
+		case <-time.After(3 * time.Second):
+			t.Fatal("upstream request remained open after cancellation")
+		}
+	})
+
+	t.Run("host_broker_account_directory_and_passive_health", func(t *testing.T) {
+		require.Eventually(t, func() bool { return directory.lists.Load() > 0 }, 5*time.Second, 50*time.Millisecond,
+			"plugin must discover synthetic account IDs through the real host broker")
+		before := directory.resolves.Load()
+		health, err := runtime.status(ctx)
+		require.NoError(t, err)
+		var discovered struct {
+			AccountIDs []int64 `json:"account_ids"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(health.StatusJson), &discovered))
+		assert.ElementsMatch(t, []int64{42, 84}, discovered.AccountIDs)
+		for i := 0; i < 3; i++ {
+			_, err := runtime.status(ctx)
+			require.NoError(t, err)
+		}
+		assert.Equal(t, before, directory.resolves.Load(), "Health must not resolve credentials or probe upstream")
+	})
+
+	t.Run("host_kv_broker_and_failed_local_proxy", func(t *testing.T) {
+		// This proxy rejects CONNECT locally and never opens an external socket.
+		// A missing persisted ticket therefore tests KVGet and identity RPCs across
+		// the real broker without sending an OAuth request to any provider.
+		var proxyRequests atomic.Int64
+		proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			proxyRequests.Add(1)
+			assert.Equal(t, http.MethodConnect, req.Method)
+			w.WriteHeader(http.StatusBadGateway)
+		}))
+		defer proxy.Close()
+		config := map[string]any{
+			"enabled": true, "dynamic_proxy_url": proxy.URL,
+			"max_attempts": 1, "attempt_interval_seconds": 1, "cooldown_seconds": 30,
+			"accounts": []map[string]any{{"account_id": 42, "enabled": true, "plan": "pro"}},
+		}
+		rawConfig, err := json.Marshal(config)
+		require.NoError(t, err)
+		require.NoError(t, runtime.validateAndApplyConfig(ctx, rawConfig))
+		defer func() { require.NoError(t, runtime.validateAndApplyConfig(ctx, []byte(`{}`))) }()
+		require.Eventually(t, func() bool { return store.gets.Load() > 0 && proxyRequests.Load() > 0 },
+			12*time.Second, 100*time.Millisecond, "active account must use the real host KV broker before a localhost-only attempt")
+		assert.Greater(t, directory.resolves.Load(), int64(0))
+		assert.Equal(t, int64(1), proxyRequests.Load(), "max_attempts=1 must bound acquisition attempts")
+		health, err := runtime.status(ctx)
+		require.NoError(t, err)
+		assert.NotContains(t, health.StatusJson, "synthetic-host-contract-token")
+	})
+
+	t.Run("kill_and_restart", func(t *testing.T) {
+		runtime.kill()
+		_, err := runtime.status(ctx)
+		require.Error(t, err)
+		restarted := stateKitContractStart(t, installation, host)
+		require.NoError(t, restarted.validateAndApplyConfig(ctx, []byte(`{}`)))
+		health, err := restarted.status(ctx)
+		require.NoError(t, err)
+		assert.True(t, health.Healthy)
+	})
+	t.Log("Verified signed package on stock Sub2API 0.2.7: installer, process handshake, account/KV broker, default-off transport, binary body, SSE streaming/cancellation, config validation, bounded localhost-proxy failure, kill/restart. No real account or provider traffic.")
+}

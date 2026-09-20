@@ -1,0 +1,14 @@
+Sub2API STATE Kit
+
+This repository includes modifications to and public plugin protocol files from
+Wei-Shaw/sub2api, distributed under LGPL-3.0. See LICENSE.
+
+Source overlay baseline: v0.2.6, 49a39b6dc1abed30fd227611e8af1108bc427610.
+Plugin protocol baseline: v0.2.7, aea725f2ea644d5592d0bbb1d63b607efa7e200a.
+The plugin protocol sources in plugin/internal/pluginapi/v1 are retained for
+standalone, reproducible builds. Import paths are adapted to this module.
+
+The STATE Kit plugin implementation is independently developed in this project;
+no proprietary OpenAI OAuth Transport plugin binary or its UI is redistributed.
+Acknowledgments: Sub2API contributors, gylive/ccodex-sleep-state, and community
+participants who provided discussion, testing, and implementation ideas.

@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+*.log
+*.db
+*.sqlite*
+*.pem
+*.key
+*.s2plugin
+*.p12
+*.pfx
+artifacts/
+build/
+dist/
+node_modules/
+__pycache__/
+.DS_Store

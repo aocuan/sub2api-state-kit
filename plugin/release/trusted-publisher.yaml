@@ -1,0 +1,4 @@
+# Merge this block into the existing Sub2API config; keep other settings.
+plugins:
+  trusted_publishers:
+    state-kit-local-v1: "FTPBkeAviJs6BeDLIT/8p6IxyXwvl8aGGqLavkwmjvQ="
