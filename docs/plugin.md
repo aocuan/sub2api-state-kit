@@ -2,10 +2,10 @@
 
 插件版使用官方 **Sub2API v0.2.7** 的 `.s2plugin` 接口，不需要覆盖或编译宿主源码。它与本仓库基于 v0.2.6 的增量版、完整部署版是三个可选入口，**选择一种即可**。
 
-- 下载：[插件版 v0.3.3](https://github.com/zhang2580384/sub2api-state-kit/releases/tag/v0.3.3)
-- 安装文件：`sub2api-state-kit_plugin_v0.3.3.s2plugin`
-- 完整插件源码：`sub2api-state-kit_plugin_v0.3.3_source.zip`，或本仓库的 [`plugin/`](../plugin/)
-- 当前发布包包含 Linux amd64 运行时，适用于常见的 x86_64 Linux 服务器。
+- 下载：[插件版 v0.3.4](https://github.com/zhang2580384/sub2api-state-kit/releases/tag/v0.3.4)
+- 安装文件：`sub2api-state-kit_plugin_v0.3.4.s2plugin`
+- 完整插件源码：`sub2api-state-kit_plugin_v0.3.4_source.zip`，或本仓库的 [`plugin/`](../plugin/)
+- 当前发布包包含 Linux amd64、Linux arm64 和 macOS arm64 运行时；宿主自动选择对应架构。
 - 官方接口基线：[v0.2.7 / aea725f](https://github.com/Wei-Shaw/sub2api/tree/aea725f2ea644d5592d0bbb1d63b607efa7e200a)。清单兼容范围为 `>=0.2.7 <0.3.0`，实际验证基线为 0.2.7，其他版本仍需测试。
 
 ## 功能和入口
@@ -23,13 +23,13 @@
 | 重启恢复 | 通过宿主的 Redis KV 保存已验证票据和到期时间；不延长原到期时间 |
 | 正常账号 | 不采集、不注入、不守护，按宿主给出的业务代理转发 |
 
-官方插件接口目前只返回账号 ID，不返回名称、邮箱、到期时间或额度。插件不会修改宿主源码，因此这些展示资料需要在插件账号列表中按账号管理页的信息维护一次；插件配置由宿主加密保存，发布包不包含任何真实账号资料。将来宿主协议增加同类字段时，当前界面会直接显示，无需重新适配。**配置入口不在原有“编辑账号”弹窗中**；向那个弹窗加控件需要修改宿主源码，增量版和完整版仍提供该入口。
+插件版通过宿主配置页的只读 Bridge 从账号管理同步账号 ID、名称、邮箱、订阅到期时间和容量摘要；不会把 OAuth Token、API Key、密码或完整凭据传入插件页面。宿主账号接口不可用时，界面会退化为只显示账号 ID，保存动作仍只包含脱敏后的展示字段。**配置入口不在原有“编辑账号”弹窗中**；向那个弹窗加控件需要修改宿主源码，增量版和完整版仍提供该入口。
 
 ## 第一次安装
 
 ### 1. 配置信任公钥
 
-官方只内置信任它自己的插件发布者。第三方插件必须在宿主 `config.yaml` 中追加发布者公钥，**只需配置一次**。下载 Release 中的 `trusted-publisher.yaml`，把其中 `plugins.trusted_publishers.state-kit-release-v1` 合并到原配置中；不要用整个示例覆盖自己的数据库、Redis 或其他设置。
+官方只内置信任它自己的插件发布者。第三方插件必须在宿主 `config.yaml` 中追加发布者公钥，**只需配置一次**。下载 Release 中的 `trusted-publisher.yaml`，把其中 `plugins.trusted_publishers.state-kit-local-v1` 合并到原配置中；不要用整个示例覆盖自己的数据库、Redis 或其他设置。
 
 公钥也在仓库的 [`publisher-public-key.txt`](../plugin/release/publisher-public-key.txt) 中。公钥可以公开，它不是 API Key 或代理密码。不要开启 `allow_unsigned`。
 
@@ -97,7 +97,7 @@ node --test ui-tests/*.test.cjs
 python3 scripts/package_plugin.py build \
   --private-key /PRIVATE/PATH/publisher.pem --output ./artifacts
 python3 scripts/package_plugin.py verify \
-  --package ./artifacts/sub2api-state-kit_plugin_v0.3.3.s2plugin
+  --package ./artifacts/sub2api-state-kit_plugin_v0.3.4.s2plugin
 ```
 
 测试覆盖范围与实际结果见 [插件验证记录](plugin-validation.md)。安装包不含作者的账号、代理凭据、API Key、数据库、STATE 或签名私钥。

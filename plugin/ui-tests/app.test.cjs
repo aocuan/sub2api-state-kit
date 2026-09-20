@@ -29,6 +29,13 @@ test('requires dynamic proxy only when global and account switches are both on',
   assert.throws(() => ui.validateConfig(config), /缺少可用/);
 });
 
+test('account labels omit empty fields instead of showing placeholder text', () => {
+  assert.equal(ui.accountOptionLabel(40, {}), '#40');
+  assert.equal(ui.accountOptionLabel(40, { name: 'account' }), '#40 · account');
+  assert.equal(ui.accountOptionLabel(40, { email: 'account@example.com' }), '#40 · account@example.com');
+  assert.equal(ui.accountOptionLabel(40, { name: 'account', email: 'account@example.com' }), '#40 · account · account@example.com');
+});
+
 test('validates bounds, renewal horizon, duplicate accounts and model allowlist', () => {
   assert.throws(() => ui.validateConfig(configured({ max_attempts: 33 })), /1–32/);
   assert.throws(() => ui.validateConfig(configured({ ttl_minutes: 61 })), /1–60/);
@@ -86,7 +93,7 @@ class Node {
 
 function uiHarness() {
   const elements = new Map();
-  const calls = { load: 0, save: [], test: 0, status: 0, proxies: 0, dispose: 0 };
+  const calls = { load: 0, save: [], test: 0, status: 0, proxies: 0, accounts: 0, dispose: 0 };
   const timers = new Map();
   const document = { getElementById: id => { if (!elements.has(id)) elements.set(id, new Node('div')); return elements.get(id); },
     createElement: tag => new Node(tag), documentElement: { scrollHeight: 900 }, body: new Node('body'), visibilityState: 'visible' };
@@ -97,7 +104,8 @@ function uiHarness() {
     async save(value) { calls.save.push(value); return { config: value }; },
     async test() { calls.test++; return { result: { message: '检查通过' } }; },
     async status() { calls.status++; return { result: { status_json: JSON.stringify(status) } }; },
-    async proxies() { calls.proxies++; return { proxies: [{ id: 17, name: '示例代理', protocol: 'socks5', host: '203.0.113.17', port: 1081, url: 'socks5://proxy-user:test-only@203.0.113.17:1081' }] }; } };
+    async proxies() { calls.proxies++; return { proxies: [{ id: 17, name: '示例代理', protocol: 'socks5', host: '203.0.113.17', port: 1081, url: 'socks5://proxy-user:test-only@203.0.113.17:1081' }] }; },
+    async accounts() { calls.accounts++; return { accounts: [{ account_id: 12, name: '账号十二', email: 'account12@example.com', expires_at: '2026-10-17', quota: '0 / 3' }] }; } };
   const global = { document, Sub2APIPluginBridge: bridge, setInterval: fn => { timers.set(1, fn); return 1; }, clearInterval: id => timers.delete(id), addEventListener() {}, removeEventListener() {} };
   const runtime = ui.start(global);
   return { elements, get: document.getElementById, calls, timers, runtime, setStatus: value => { status = value; } };
@@ -112,7 +120,7 @@ test('passive status refresh preserves unsaved form and never invokes test or sa
   await h.runtime.refreshStatus();
   assert.equal(h.get('dynamic-proxy-url').value, 'socks5h://unsaved:password@proxy.example:1080');
   assert.equal(h.get('save-state').textContent, '有未保存修改');
-  assert.equal(h.calls.load, 1); assert.equal(h.calls.save.length, 0); assert.equal(h.calls.test, 0);
+  assert.equal(h.calls.load, 1); assert.equal(h.calls.save.length, 0); assert.equal(h.calls.test, 0); assert.equal(h.calls.accounts, 1);
   assert.equal(h.get('new-account-id').children.length, 4);
   h.runtime.stop(); assert.equal(h.timers.size, 0);
 });
@@ -150,7 +158,7 @@ test('explicit save button works without native form submission in sandbox', asy
   assert.equal(h.calls.save.length, 1);
   assert.equal(h.calls.save[0].enabled, false);
   assert.equal(h.calls.save[0].accounts[1].enabled, false);
-  assert.equal(h.calls.save[0].accounts[1].name, '');
+  assert.equal(h.calls.save[0].accounts[1].name, '账号十二');
   assert.equal(h.get('save-state').textContent, '已保存');
   assert.match(h.get('notice').textContent, /STATE Kit 已关闭/);
   h.runtime.stop();
@@ -174,7 +182,7 @@ test('detected account dropdown shows ID, name and email while model accepts pre
   const h = uiHarness(); await settle();
   const choices = h.get('new-account-id').children;
   assert.match(String(choices[1].textContent), /#7 · 示例账号 · owner@example\.com/);
-  assert.match(String(choices[2].textContent), /#12 · 未填写名称 · 未填写邮箱/);
+  assert.match(String(choices[2].textContent), /#12 · 账号十二 · account12@example\.com/);
   h.get('new-account-id').value = '7';
   await h.get('add-account').click();
   assert.match(h.get('notice').textContent, /已在列表中/);

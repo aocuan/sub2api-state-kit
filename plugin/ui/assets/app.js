@@ -54,9 +54,21 @@
     return accountText(account && account.email, 'email');
   }
   function accountOptionLabel(id, account) {
-    const name = accountName(account) || '未填写名称';
-    const email = accountEmail(account) || '未填写邮箱';
-    return '#' + id + ' · ' + name + ' · ' + email;
+    const parts = ['#' + id];
+    const name = accountName(account);
+    const email = accountEmail(account);
+    if (name) parts.push(name);
+    if (email) parts.push(email);
+    return parts.join(' · ');
+  }
+  function normalizeAccountCatalog(response) {
+    const source = response && Array.isArray(response.accounts) ? response.accounts : [];
+    return source.map(function (account) {
+      const id = accountID(account && account.account_id);
+      if (id === null) return null;
+      return { account_id: id, name: safeAccountText(account.name, 'name'), email: safeAccountText(account.email, 'email'),
+        expires_at: safeAccountText(account.expires_at, 'expires_at'), quota: safeAccountText(account.quota, 'quota') };
+    }).filter(Boolean).slice(0, 1000);
   }
   function proxyID(value) {
     const number = Number(value);
@@ -178,6 +190,7 @@
     let pollTimer;
     let resizeObserver;
     let accounts = [];
+    let hostAccountCatalog = [];
     let statusAccountCatalog = [];
     let proxies = [];
     let savedUpstreamProxyID = 0;
@@ -271,14 +284,23 @@
     }
     function accountMetadataByID(id) {
       const local = accounts.find(function (account) { return account.account_id === id; });
+      const host = hostAccountCatalog.find(function (account) { return account.account_id === id; });
       const remote = statusAccountCatalog.find(function (account) { return account.account_id === id; });
       return {
         account_id: id,
-        name: accountName(local) || accountName(remote),
-        email: accountEmail(local) || accountEmail(remote),
-        expires_at: accountText(local && local.expires_at, 'expires_at') || accountText(remote && remote.expires_at, 'expires_at'),
-        quota: accountText(local && local.quota, 'quota') || accountText(remote && remote.quota, 'quota')
+        name: accountName(host) || accountName(local) || accountName(remote),
+        email: accountEmail(host) || accountEmail(local) || accountEmail(remote),
+        expires_at: accountText(host && host.expires_at, 'expires_at') || accountText(local && local.expires_at, 'expires_at') || accountText(remote && remote.expires_at, 'expires_at'),
+        quota: accountText(host && host.quota, 'quota') || accountText(local && local.quota, 'quota') || accountText(remote && remote.quota, 'quota')
       };
+    }
+    function mergeHostAccountMetadata(account) {
+      const host = hostAccountCatalog.find(function (item) { return item.account_id === account.account_id; });
+      if (!host) return account;
+      ['name', 'email', 'expires_at', 'quota'].forEach(function (key) {
+        if (host[key]) account[key] = host[key];
+      });
+      return account;
     }
     function renderDetectedAccounts(ids) {
       const select = byID('new-account-id');
@@ -341,7 +363,7 @@
       renderProxyOptions(savedUpstreamProxyID);
       byID('dynamic-proxy-url').value = config.dynamic_proxy_url;
       Object.keys(numberIDs).forEach(function (key) { byID(numberIDs[key]).value = config[key]; });
-      accounts = config.accounts;
+      accounts = config.accounts.map(mergeHostAccountMetadata);
       renderAccounts();
       dirty = false;
       updateSaveState();
@@ -379,7 +401,7 @@
       byID('status-summary').textContent = status.message || (status.host_ready ? '状态已更新' : '等待宿主提供账号信息；可先保存配置。');
       statusAccountCatalog = status.account_catalog.slice();
       renderDetectedAccounts(status.account_ids);
-      byID('account-discovery').textContent = status.account_ids.length ? '发现 ' + status.account_ids.length + ' 个账号。下拉会优先显示已保存的名称和邮箱。' : '暂未发现账号，也可以手动填写 ID。宿主不会向此页面提供账号 Token。';
+      byID('account-discovery').textContent = status.account_ids.length ? '发现 ' + status.account_ids.length + ' 个账号。名称、邮箱、到期时间和额度会从账号管理同步。' : '暂未发现账号，也可以手动填写 ID。宿主不会向此页面提供账号 Token。';
       const body = byID('tickets-body'); body.replaceChildren();
       status.tickets.forEach(function (ticket) {
         const id = accountID(ticket.account_id);
@@ -482,16 +504,23 @@
         if (!bridge) throw new Error('配置桥接未加载，请重新打开插件配置页。');
         bridge.ready();
         let proxyLoadError = '';
+        let accountLoadError = '';
         try {
           proxies = normalizeProxies(await bridge.proxies());
         } catch (error) {
           proxyLoadError = error && error.message ? error.message : '无法读取 IP 管理代理列表。';
+        }
+        try {
+          hostAccountCatalog = normalizeAccountCatalog(await bridge.accounts());
+        } catch (error) {
+          accountLoadError = error && error.message ? error.message : '无法从账号管理同步账号信息。';
         }
         const response = await bridge.load();
         if (closed) return;
         applyConfig(response.config); loaded = true; setBusy(false); resize();
         if (global.ResizeObserver) { resizeObserver = new global.ResizeObserver(resize); resizeObserver.observe(document.body); }
         if (proxyLoadError) notice('无法读取 IP 管理代理列表：' + proxyLoadError, 'error');
+        else if (accountLoadError) notice('账号管理资料暂未同步，下拉将只显示账号 ID：' + accountLoadError, 'warning');
         await refreshStatus();
         if (!closed) pollTimer = global.setInterval(function () { if (document.visibilityState !== 'hidden') refreshStatus(); }, 10000);
       } catch (error) { if (!closed) { notice(error.message, 'error'); updateSaveState('配置未加载'); byID('connection-status').textContent = '连接失败'; } }
@@ -499,5 +528,6 @@
     return { stop: stop, refreshStatus: refreshStatus };
   }
   return { DEFAULT_CONFIG: DEFAULT_CONFIG, normalizeConfig: normalizeConfig, validateConfig: validateConfig,
-    accountID: accountID, parseStatus: parseStatus, stateLabel: stateLabel, errorLabel: errorLabel, redactError: redactError, remainingText: remainingText, start: start };
+    accountID: accountID, accountOptionLabel: accountOptionLabel, normalizeAccountCatalog: normalizeAccountCatalog,
+    parseStatus: parseStatus, stateLabel: stateLabel, errorLabel: errorLabel, redactError: redactError, remainingText: remainingText, start: start };
 });

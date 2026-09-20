@@ -94,6 +94,15 @@ test('proxy list uses an explicit read-only bridge request', async () => {
   h.bridge.dispose();
 });
 
+test('account list uses an explicit read-only bridge request', async () => {
+  const h = harness();
+  const promise = h.bridge.accounts();
+  assert.equal(h.posted[0].data.type, 'accounts.list');
+  h.respond(0, { accounts: [{ account_id: 40, name: 'account', email: 'account@example.com' }] });
+  assert.equal((await promise).accounts[0].account_id, 40);
+  h.bridge.dispose();
+});
+
 test('bridge rejects missing token and refuses non-web parent origin', async () => {
   const absent = harness({ location: { hash: '', href: 'https://sub2.example/index.html' } });
   await assert.rejects(absent.bridge.load(), /配置页打开/);

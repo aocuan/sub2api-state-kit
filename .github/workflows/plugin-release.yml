@@ -1,0 +1,75 @@
+name: Verify signed STATE plugin on native Linux
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Draft or published release containing the signed plugin
+        required: true
+        default: v0.3.4
+
+permissions:
+  contents: write
+
+jobs:
+  plugin:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+          cache-dependency-path: plugin/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Backend race tests and UI bridge tests
+        working-directory: plugin
+        run: |
+          go test -race ./... -count=1
+          node --test ui-tests/*.test.cjs
+      - name: Download and verify exact release package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.s2plugin' --pattern SHA256SUMS --dir artifacts
+          python3 scripts/package_plugin.py verify --package artifacts/sub2api-state-kit_plugin_v0.3.4.s2plugin
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          p = Path('artifacts/sub2api-state-kit_plugin_v0.3.4.s2plugin')
+          expected = next(line.split()[0] for line in Path('artifacts/SHA256SUMS').read_text().splitlines() if line.endswith(p.name))
+          assert hashlib.sha256(p.read_bytes()).hexdigest() == expected
+          PY
+      - name: Check release runtime matches this source
+        env:
+          ARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
+        run: |
+          (cd plugin && go build -trimpath -buildvcs=false -ldflags='-s -w' -o ../rebuilt-state-kit ./cmd/state-kit)
+          python3 - <<'PY'
+          import hashlib, os, zipfile
+          from pathlib import Path
+          with zipfile.ZipFile('artifacts/sub2api-state-kit_plugin_v0.3.4.s2plugin') as z:
+              delivered = z.read('runtimes/linux-' + os.environ['ARCH'] + '/state-kit')
+          assert hashlib.sha256(delivered).digest() == hashlib.sha256(Path('rebuilt-state-kit').read_bytes()).digest(), 'Release binary differs from source build'
+          PY
+      - name: Load with stock Sub2API v0.2.7 installer and process runtime
+        run: |
+          git clone --depth 1 --branch v0.2.7 https://github.com/Wei-Shaw/sub2api.git stock-host
+          test "$(git -C stock-host rev-parse HEAD)" = aea725f2ea644d5592d0bbb1d63b607efa7e200a
+          python3 plugin/integration/run_host_contract.py --host-src stock-host --package artifacts/sub2api-state-kit_plugin_v0.3.4.s2plugin --public-key plugin/release/publisher-public-key.txt --log host-contract.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: plugin-native-${{ matrix.arch }}
+          path: host-contract.log

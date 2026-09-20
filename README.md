@@ -1,8 +1,8 @@
 # Sub2API STATE Kit
 
-这是一个面向官方 Sub2API `v0.2.7` 的独立 `OpenAI OAuth` transport 插件，在 `v0.3.3` 基础上维护并开源。插件 ID 保持为 `io.github.wangyunjeff.sub2api-state-kit`，可从既有 `v0.3.2` 直接停用后覆盖升级，不需要修改或重新编译 Sub2API 宿主源码。
+这是一个面向官方 Sub2API `v0.2.7` 的独立 `OpenAI OAuth` transport 插件，在 `v0.3.3` 基础上维护并开源。插件 ID 保持为 `io.github.wangyunjeff.sub2api-state-kit`，可从既有版本停用后覆盖升级。
 
-当前签名发布包只包含 Linux amd64 运行时。
+当前签名发布包包含 Linux amd64、Linux arm64 和 macOS arm64 运行时。
 
 ## 功能
 
@@ -13,11 +13,11 @@
 - 保留按账号启用的 Pro / Team STATE 管理、动态代理采集、固定业务代理复验、续期和异常守护。
 - 第一层代理可直接选择 Sub2API IP 管理中的代理，第二层填写动态代理地址。
 
-官方宿主插件协议目前只返回账号 ID，不返回账号名称、邮箱、到期时间或额度。插件不修改宿主源码，因此这些展示资料需按账号管理页维护一次；配置由宿主加密保存。将来宿主协议增加同类字段时，当前界面会直接显示。
+账号选择框和资料列表通过宿主配置页的只读 Bridge 从账号管理同步 ID、名称、邮箱、订阅到期时间和容量摘要，不会把 OAuth Token、API Key、密码或完整凭据传入插件页面。官方原版宿主接口只返回账号 ID；此时插件会退化为只显示 ID，不会生成“未填写名称 / 未填写邮箱”占位文字。
 
 ## 安装与升级
 
-1. 下载 [`sub2api-state-kit_plugin_v0.3.3.s2plugin`](https://github.com/zhang2580384/sub2api-state-kit/releases/tag/v0.3.3)。
+1. 下载 [`sub2api-state-kit_plugin_v0.3.4.s2plugin`](https://github.com/zhang2580384/sub2api-state-kit/releases/tag/v0.3.4)。
 2. 在 Sub2API 的 `插件管理` 中上传并启用插件。
 3. 第一层代理从 IP 管理中选择；第二层填写 HTTP(S) 或 SOCKS5(H) 动态代理地址。
 4. 添加需要处理的账号，补全展示资料，选择 Pro / Team 和模型，再开启账号与总开关。

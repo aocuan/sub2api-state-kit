@@ -1,6 +1,6 @@
 # 插件版验证记录
 
-对象：STATE Kit 插件 `0.3.3`，官方 Sub2API `v0.2.7`（`aea725f2ea644d5592d0bbb1d63b607efa7e200a`）。当前签名包只包含 Linux amd64 运行时。
+对象：STATE Kit 插件 `0.3.4`，官方 Sub2API `v0.2.7`（`aea725f2ea644d5592d0bbb1d63b607efa7e200a`）。签名包包含 Linux amd64、Linux arm64 和 macOS arm64 运行时。
 
 ## 自动化验证
 
@@ -8,7 +8,7 @@
 
 - `go test -race ./...`：通过。
 - `go vet ./...`：通过。
-- `node --test ui-tests/*.test.cjs`：18 项通过。
+- `node --test ui-tests/*.test.cjs`：20 项通过。
 - `node --check ui/assets/app.js` 与 `node --check ui/assets/bridge-v1.js`：通过。
 - `.s2plugin` 清单哈希、Ed25519 发布者签名和包内路径：通过。
 
@@ -19,23 +19,27 @@
 ## 宿主和生产验收
 
 - 使用官方 Sub2API `v0.2.7` 安装包协议完成签名安装和插件进程启动。
-- 在现有测试实例上将 `v0.3.2` 停用后升级到 `v0.3.3`，再重新启用；插件 ID 保持不变，宿主机源码和容器无需重启。
-- 配置页成功读取宿主账号目录和 IP 管理代理列表。
+- 在现有测试实例上将 `v0.3.3` 停用后升级到 `v0.3.4`，再重新启用；插件 ID 保持不变。
+- 配置页通过宿主只读 Bridge 成功读取账号管理和 IP 管理代理列表。
 - 账号资料区显示并保存账号名称、邮箱、到期时间和额度摘要。
 - 已发现账号下拉框显示 `账号 ID + 名称 + 邮箱`。
 - 运行状态显示 `账号：ID + 名称` 和 `模型：模型名`。
 
 验收页面未保存截图；真实账号资料只存在于运行实例的加密插件配置中，不进入源码、签名包、源码包或 Release。
 
-## 当前 Linux amd64 包
+## 当前签名包
 
 ```text
-2792970abb9fdf261e706be8322ffd4211aa4ffb6461af146d445e1a78c2d8ea  sub2api-state-kit_plugin_v0.3.3.s2plugin
+sub2api-state-kit_plugin_v0.3.4.s2plugin
+15698791 bytes
+SHA256 b6aeb9499b0bfb4765f8bf79d2e900888c331b9945cf50d381b2c958ba8c2f33
+
+源码包的最终 SHA256 以 Release 中 `SHA256SUMS` 为准。
 ```
 
 ## 未包含的验证
 
 - 没有使用真实 OAuth 账号对每个模型执行生产压测。
 - 不承诺上游一定返回符合长度条件的 STATE，也不保证消除配额、429 或上游过载。
-- 当前宿主协议只向插件返回账号 ID，不返回账号名称、邮箱、到期时间或额度；这些展示资料需要按账号管理页维护一次。
+- 自定义宿主镜像需要包含只读 `accounts.list` Bridge；官方原版宿主只提供账号 ID。插件在 Bridge 不可用时会退化为只显示账号 ID。
 - 不支持多副本协调；当前部署范围为单个 Sub2API 应用实例。
