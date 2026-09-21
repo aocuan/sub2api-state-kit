@@ -2,9 +2,9 @@
 
 插件版使用官方 **Sub2API v0.2.7** 的 `.s2plugin` 接口，不需要覆盖或编译宿主源码。它与本仓库基于 v0.2.6 的增量版、完整部署版是三个可选入口，**选择一种即可**。
 
-- 下载：[插件版 v0.3.6](https://github.com/zhang2580384/sub2api-state-kit/releases/tag/v0.3.6)
-- 安装文件：`sub2api-state-kit_plugin_v0.3.6.s2plugin`
-- 完整插件源码：`sub2api-state-kit_plugin_v0.3.6_source.zip`，或本仓库的 [`plugin/`](../plugin/)
+- 下载：[插件版 v0.3.7](https://github.com/zhang2580384/sub2api-state-kit/releases/tag/v0.3.7)
+- 安装文件：`sub2api-state-kit_plugin_v0.3.7.s2plugin`
+- 完整插件源码：`sub2api-state-kit_plugin_v0.3.7_source.zip`，或本仓库的 [`plugin/`](../plugin/)
 - 当前发布包包含 Linux amd64、Linux arm64 和 macOS arm64 运行时；宿主自动选择对应架构。
 - 官方接口基线：[v0.2.7 / aea725f](https://github.com/Wei-Shaw/sub2api/tree/aea725f2ea644d5592d0bbb1d63b607efa7e200a)。清单兼容范围为 `>=0.2.7 <0.3.0`，实际验证基线为 0.2.7，其他版本仍需测试。
 
@@ -22,7 +22,7 @@
 | 固定出口复验 | 采集响应模型匹配后，再用该账号选定的业务代理携带候选 STATE 复验 |
 | 后台续期 | 默认有效期 60 分钟、提前 10 分钟续期；失败保留仍有效的旧票据 |
 | 动态守护 | 观察响应中的 312 字节 STATE 或完整成功响应的模型不符，作废本次所用票据并重采 |
-| 诊断日志 | 可选开关；记录采集与固定业务出口 IP、292/312/332 分类、响应模型、耗时和结果，最多保留 240 条脱敏事件 |
+| 实时诊断监听 | 只有打开“实时诊断监听”面板才采集；新事件置顶，关闭面板即停止并清空，不保存历史 |
 | 重启恢复 | 通过宿主的 Redis KV 保存已验证票据和到期时间；不延长原到期时间 |
 | 正常账号 | 不采集、不注入、不守护，按宿主给出的业务代理转发 |
 
@@ -101,7 +101,7 @@ node --test ui-tests/*.test.cjs
 python3 scripts/package_plugin.py build \
   --private-key /PRIVATE/PATH/publisher.pem --output ./artifacts
 python3 scripts/package_plugin.py verify \
-  --package ./artifacts/sub2api-state-kit_plugin_v0.3.6.s2plugin
+  --package ./artifacts/sub2api-state-kit_plugin_v0.3.7.s2plugin
 ```
 
 测试覆盖范围与实际结果见 [插件验证记录](plugin-validation.md)。安装包不含作者的账号、代理凭据、API Key、数据库、STATE 或签名私钥。

@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -109,9 +108,9 @@ func waitFor(t *testing.T, e *Engine, state string) {
 	t.Helper()
 	deadline := time.Now().Add(4 * time.Second)
 	for time.Now().Before(deadline) {
-		r, _ := e.Health(context.Background(), &pluginv1.HealthRequest{})
-		var s statusSnapshot
-		json.Unmarshal([]byte(r.StatusJson), &s)
+		e.mu.Lock()
+		s := e.snapshotLocked(time.Now())
+		e.mu.Unlock()
 		if len(s.Tickets) > 0 && s.Tickets[0].State == state {
 			return
 		}

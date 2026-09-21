@@ -10,7 +10,12 @@ import (
 	"time"
 )
 
-const maxDiagnosticEvents = 240
+const (
+	maxDiagnosticEvents       = 240
+	diagnosticBurstGap        = 750 * time.Millisecond
+	diagnosticBurstCount      = 3
+	diagnosticListenKeepalive = 3 * time.Second
+)
 
 // diagnosticEvent intentionally contains fingerprints and classifications only.
 // Raw STATE values, OAuth tokens, proxy credentials, and request headers are
@@ -36,10 +41,41 @@ type diagnosticEvent struct {
 	DurationMS    int64  `json:"duration_ms,omitempty"`
 }
 
-func (e *Engine) diagnosticsEnabled() bool {
+func (e *Engine) diagnosticsListeningLocked(now time.Time) bool {
+	return e.diagnosticUntil.After(now)
+}
+
+// The host bridge is read-only, so the UI signals an open diagnostics panel by
+// polling Health at a faster cadence than the normal status refresh. Two close
+// polls open a short listener window; after the panel closes the window expires
+// on its own and no events are retained.
+func (e *Engine) observeDiagnosticPollLocked(now time.Time) {
+	gap := time.Duration(0)
+	if !e.diagnosticPollAt.IsZero() {
+		gap = now.Sub(e.diagnosticPollAt)
+	}
+	if !e.diagnosticPollAt.IsZero() && gap <= diagnosticBurstGap {
+		e.diagnosticBurst++
+	} else {
+		e.diagnosticBurst = 1
+	}
+	active := e.diagnosticsListeningLocked(now)
+	if active && gap <= diagnosticBurstGap {
+		e.diagnosticUntil = now.Add(diagnosticListenKeepalive)
+	} else if !active && e.diagnosticBurst >= diagnosticBurstCount {
+		e.diagnostics = nil
+		e.diagnosticSeq = 0
+		e.diagnosticUntil = now.Add(diagnosticListenKeepalive)
+	} else if !active && gap > diagnosticBurstGap && len(e.diagnostics) != 0 {
+		e.diagnostics = nil
+	}
+	e.diagnosticPollAt = now
+}
+
+func (e *Engine) diagnosticsListening() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.config.DiagnosticLogEnabled
+	return e.diagnosticsListeningLocked(time.Now())
 }
 
 func (e *Engine) recordDiagnostic(event diagnosticEvent) {
@@ -48,7 +84,7 @@ func (e *Engine) recordDiagnostic(event diagnosticEvent) {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if !e.config.DiagnosticLogEnabled {
+	if !e.diagnosticsListeningLocked(time.Now()) {
 		return
 	}
 	e.diagnosticSeq++
@@ -149,7 +185,7 @@ func egressMatch(capture, fixed string) *bool {
 }
 
 func (e *Engine) lookupEgressIP(ctx context.Context, proxyURL, upstreamProxyURL string) string {
-	if !e.diagnosticsEnabled() {
+	if !e.diagnosticsListening() {
 		return ""
 	}
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)

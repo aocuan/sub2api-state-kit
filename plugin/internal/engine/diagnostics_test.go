@@ -6,13 +6,12 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	pluginv1 "github.com/zhang2580384/sub2api-state-kit/plugin/internal/pluginapi/v1"
 )
 
 type diagnosticStatus struct {
-	DiagnosticsEnabled bool              `json:"diagnostics_enabled"`
-	Diagnostics        []diagnosticEvent `json:"diagnostics"`
+	DiagnosticsEnabled   bool              `json:"diagnostics_enabled"`
+	DiagnosticsListening bool              `json:"diagnostics_listening"`
+	Diagnostics          []diagnosticEvent `json:"diagnostics"`
 }
 
 func diagnosticHealth(t *testing.T, e *Engine) diagnosticStatus {
@@ -28,24 +27,23 @@ func diagnosticHealth(t *testing.T, e *Engine) diagnosticStatus {
 	return status
 }
 
-func TestDiagnosticLogIsOptInBoundedAndRedacted(t *testing.T) {
+func TestDiagnosticListenerIsUiScopedBoundedAndRedacted(t *testing.T) {
 	e := newEngine(nil, "https://example.invalid", time.Second)
 	defer e.Close()
 
 	rawState := testState(292)
 	e.recordDiagnostic(diagnosticEvent{Stage: "capture", Outcome: "accepted", StateClass: stateDiagnosticClass(rawState),
 		TargetProxy: "socks5://proxy-user:proxy-secret@proxy.example:1080", CaptureEgress: "203.0.113.18"})
-	if status := diagnosticHealth(t, e); status.DiagnosticsEnabled || len(status.Diagnostics) != 0 {
-		t.Fatalf("diagnostics were active while disabled: %+v", status)
+	if status := diagnosticHealth(t, e); status.DiagnosticsEnabled || status.DiagnosticsListening || len(status.Diagnostics) != 0 {
+		t.Fatalf("diagnostics were active without an open panel: %+v", status)
 	}
 
-	config, err := ParseConfig([]byte(`{"diagnostic_log_enabled":true}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := e.ApplyConfig(context.Background(), &pluginv1.ApplyConfigRequest{ConfigJson: []byte(jsonText(config))}); err != nil {
-		t.Fatal(err)
-	}
+	started := time.Now()
+	e.mu.Lock()
+	e.observeDiagnosticPollLocked(started)
+	e.observeDiagnosticPollLocked(started.Add(400 * time.Millisecond))
+	e.observeDiagnosticPollLocked(started.Add(800 * time.Millisecond))
+	e.mu.Unlock()
 	for i := 0; i < maxDiagnosticEvents+10; i++ {
 		e.recordDiagnostic(diagnosticEvent{Stage: "capture", Outcome: "accepted", StateClass: stateDiagnosticClass(rawState),
 			TargetProxy: "socks5://proxy-user:proxy-secret@proxy.example:1080", CaptureEgress: "203.0.113.18"})
@@ -56,7 +54,10 @@ func TestDiagnosticLogIsOptInBoundedAndRedacted(t *testing.T) {
 	}
 	status := diagnosticHealth(t, e)
 	if !status.DiagnosticsEnabled {
-		t.Fatal("diagnostic switch was not reported")
+		t.Fatal("diagnostic listener was not reported")
+	}
+	if !status.DiagnosticsListening {
+		t.Fatal("diagnostic listener compatibility flag was not reported")
 	}
 	if len(status.Diagnostics) != maxDiagnosticEvents {
 		t.Fatalf("diagnostic log length = %d, want %d", len(status.Diagnostics), maxDiagnosticEvents)
@@ -69,6 +70,42 @@ func TestDiagnosticLogIsOptInBoundedAndRedacted(t *testing.T) {
 	}
 	if !strings.Contains(response.StatusJson, "socks5://proxy.example:1080") {
 		t.Fatalf("redacted proxy endpoint missing: %s", response.StatusJson)
+	}
+
+	expired := started.Add(20 * time.Second)
+	e.mu.Lock()
+	e.observeDiagnosticPollLocked(expired)
+	statusAfterClose := e.snapshotLocked(expired)
+	e.mu.Unlock()
+	if statusAfterClose.DiagnosticsListening || len(statusAfterClose.Diagnostics) != 0 {
+		t.Fatalf("diagnostics survived after the UI listener expired: %+v", statusAfterClose)
+	}
+}
+
+func TestDiagnosticListenerIgnoresNormalOneSecondHostHealthChecks(t *testing.T) {
+	e := newEngine(nil, "https://example.invalid", time.Second)
+	defer e.Close()
+
+	started := time.Now()
+	e.mu.Lock()
+	for i := 0; i < 4; i++ {
+		e.observeDiagnosticPollLocked(started.Add(time.Duration(i) * time.Second))
+	}
+	active := e.diagnosticsListeningLocked(started.Add(3 * time.Second))
+	e.mu.Unlock()
+	if active {
+		t.Fatal("normal host health checks incorrectly opened the diagnostics listener")
+	}
+
+	e.mu.Lock()
+	burst := started.Add(5 * time.Second)
+	for i := 0; i < diagnosticBurstCount; i++ {
+		e.observeDiagnosticPollLocked(burst.Add(time.Duration(i) * 300 * time.Millisecond))
+	}
+	active = e.diagnosticsListeningLocked(burst.Add(600 * time.Millisecond))
+	e.mu.Unlock()
+	if !active {
+		t.Fatal("UI status burst did not open the diagnostics listener")
 	}
 }
 

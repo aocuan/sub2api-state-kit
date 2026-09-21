@@ -76,7 +76,7 @@ test('validates bounds, renewal horizon, duplicate accounts and model allowlist'
 
 test('status tolerates pre-initialization, de-duplicates safe IDs, never labels unknown state as raw text', () => {
   assert.deepEqual(ui.parseStatus({ healthy: true }), { host_ready: false, account_ids: [], account_catalog: [], tickets: [],
-    diagnostics_enabled: false, diagnostics: [], message: '' });
+    diagnostics_enabled: false, diagnostics_listening: false, diagnostics: [], message: '' });
   const status = ui.parseStatus({ status_json: JSON.stringify({ host_ready: true, account_ids: [8, 2, 8, null, -1, '9', '9007199254740992'],
     account_catalog: [{ account_id: 8, name: ' Eight ', email: 'eight@example.com', expires_at: '2026-10-01', quota: '10/20' }], tickets: [] }) });
   assert.deepEqual(status.account_ids, [2, 8, 9]);
@@ -252,26 +252,35 @@ test('account egress mode and sticky proxy are saved per account', async () => {
   h.runtime.stop();
 });
 
-test('diagnostic switch saves and modal renders sanitized evidence', async () => {
+test('diagnostic panel listens only while open, places newest first and clears on close', async () => {
   const h = uiHarness(); await settle();
-  h.get('diagnostic-log-enabled').checked = true;
-  await h.get('save-config').click();
-  assert.equal(h.calls.save[0].diagnostic_log_enabled, true);
-  h.setStatus({ host_ready: true, tickets: [], diagnostics_enabled: true, diagnostics: [{
+  h.setStatus({ host_ready: true, tickets: [], diagnostics_enabled: true, diagnostics_listening: true, diagnostics: [{
     seq: 1, time: '2026-09-21T12:00:00Z', account_id: 19, model: 'gpt-6-astra', stage: 'fixed_validation',
     upstream_proxy: 'socks5://user:secret@first.example:1081', target_proxy: 'socks5://user:secret@business.example:1081',
     capture_egress: '203.0.113.18', fixed_egress: '198.51.100.24', egress_match: false, state_length: 312,
     state_class: '312', response_model: 'gpt-5.6-luna', http_status: 200, outcome: 'state_312', duration_ms: 88
+  }, {
+    seq: 2, time: '2026-09-21T12:00:01Z', account_id: 20, model: 'gpt-6-astra', stage: 'capture',
+    target_proxy: 'socks5://user:secret@capture.example:1081', capture_egress: '203.0.113.19',
+    state_length: 292, state_class: '292', response_model: 'gpt-6-astra', http_status: 200, outcome: 'accepted', duration_ms: 55
   }] });
   await h.get('open-diagnostics').click();
+  assert.equal(h.calls.status >= 3, true);
+  assert.equal(h.calls.save.length, 0);
+  h.timers.get(1)();
+  await settle();
   function text(node) { return String(node.textContent) + node.children.map(text).join(''); }
   const rendered = text(h.get('diagnostics-body'));
   assert.equal(h.get('diagnostics-dialog').open, true);
+  assert.match(text(h.get('diagnostics-body').children[0]), /#20/);
   assert.match(rendered, /采集：203\.0\.113\.18/);
   assert.match(rendered, /固定：198\.51\.100\.24/);
   assert.match(rendered, /出口不一致/);
   assert.match(rendered, /312 · 312/);
   assert.match(rendered, /gpt-5\.6-luna/);
   assert.equal(rendered.includes('secret'), false);
+  h.get('diagnostics-dialog').close();
+  assert.equal(h.get('diagnostics-body').children.length, 0);
+  assert.equal(h.timers.size, 0);
   h.runtime.stop();
 });

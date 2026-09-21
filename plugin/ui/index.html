@@ -59,8 +59,6 @@
             <div><label for="attempt-interval-seconds">尝试间隔（秒）</label><input id="attempt-interval-seconds" type="number" min="1" max="300" value="10" required></div>
             <div><label for="cooldown-seconds">失败后冷却（秒）</label><input id="cooldown-seconds" type="number" min="30" max="3600" value="300" required></div>
           </div>
-          <label class="switch-label diagnostic-switch"><input id="diagnostic-log-enabled" type="checkbox" role="switch"><span>记录诊断日志</span></label>
-          <p class="help">开启后记录采集出口、固定业务出口、292/312/332 状态长度、响应模型和结果。日志仅保存在插件进程内，最多 240 条，不记录票据原文或凭据。</p>
           <p class="help">有效期是本地使用上限，上游可能提前使票据失效。提前续期必须小于有效期。</p>
         </details>
       </fieldset>
@@ -78,11 +76,11 @@
   </main>
   <dialog id="diagnostics-dialog" class="diagnostics-dialog" aria-labelledby="diagnostics-title">
     <div class="diagnostics-head">
-      <div><h2 id="diagnostics-title">诊断日志</h2><p id="diagnostics-summary" class="muted">正在读取日志…</p></div>
+      <div><h2 id="diagnostics-title">实时诊断监听</h2><p id="diagnostics-summary" class="muted">打开面板后开始实时监听，不保存日志。</p></div>
       <div class="actions"><button id="diagnostics-refresh" type="button" class="secondary">刷新</button><button id="diagnostics-copy" type="button" class="secondary">复制</button><button id="diagnostics-close" type="button" class="secondary">关闭</button></div>
     </div>
     <div class="table-wrap diagnostics-table"><table><thead><tr><th scope="col">时间</th><th scope="col">账号 / 模型</th><th scope="col">阶段</th><th scope="col">代理链</th><th scope="col">出口 IP</th><th scope="col">状态</th><th scope="col">响应</th><th scope="col">结果</th><th scope="col">耗时</th></tr></thead><tbody id="diagnostics-body"></tbody></table></div>
-    <p id="diagnostics-empty" class="empty">暂无诊断记录。请先在高级参数中开启并保存。</p>
+    <p id="diagnostics-empty" class="empty">正在等待新事件；关闭面板即停止监听。</p>
   </dialog>
 </body>
 </html>

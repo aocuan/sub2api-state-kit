@@ -5,7 +5,7 @@
   else api.start(global);
 })(typeof window === 'object' ? window : null, function () {
   'use strict';
-  const DEFAULT_CONFIG = Object.freeze({ enabled: false, upstream_proxy_id: 0, upstream_proxy_url: '', dynamic_proxy_url: '', diagnostic_log_enabled: false, ttl_minutes: 60,
+  const DEFAULT_CONFIG = Object.freeze({ enabled: false, upstream_proxy_id: 0, upstream_proxy_url: '', dynamic_proxy_url: '', ttl_minutes: 60,
     refresh_before_minutes: 10, max_attempts: 8, attempt_interval_seconds: 10, cooldown_seconds: 300 });
   const NUMBERS = Object.freeze({ ttl_minutes: [1, 60, '票据有效期'], refresh_before_minutes: [0, 59, '提前续期'],
     max_attempts: [1, 32, '每轮最多尝试'], attempt_interval_seconds: [1, 300, '尝试间隔'], cooldown_seconds: [30, 3600, '失败后冷却'] });
@@ -108,7 +108,6 @@
     if (proxyID(config.upstream_proxy_id) === null) throw new Error('第一层代理编号格式不正确。');
     validateProxyAddress(config.upstream_proxy_url, '第一层代理');
     validateProxyAddress(config.dynamic_proxy_url, '动态代理');
-    if (typeof config.diagnostic_log_enabled !== 'boolean') throw new Error('诊断日志开关格式不正确。');
     Object.keys(NUMBERS).forEach(function (key) {
       const bounds = NUMBERS[key];
       if (!Number.isInteger(config[key]) || config[key] < bounds[0] || config[key] > bounds[1]) {
@@ -221,6 +220,7 @@
       account_catalog: catalog,
       tickets: Array.isArray(status.tickets) ? status.tickets.filter(function (ticket) { return ticket && accountID(ticket.account_id) !== null; }).slice(0, 4096) : [],
       diagnostics_enabled: status.diagnostics_enabled === true,
+      diagnostics_listening: status.diagnostics_listening === true || status.diagnostics_enabled === true,
       diagnostics: Array.isArray(status.diagnostics) ? status.diagnostics.map(normalizeDiagnostic).filter(Boolean).slice(-240) : [],
       message: redactError(MESSAGES[status.message] || status.message || result && result.message || '') };
   }
@@ -240,6 +240,9 @@
     let dirty = false;
     let statusBusy = false;
     let diagnosticsBusy = false;
+    let diagnosticsOpen = false;
+    let diagnosticsListening = false;
+    let diagnosticsTimer;
     let closed = false;
     let pollTimer;
     let resizeObserver;
@@ -445,7 +448,6 @@
       savedUpstreamProxyURL = config.upstream_proxy_url;
       renderProxyOptions(savedUpstreamProxyID);
       byID('dynamic-proxy-url').value = config.dynamic_proxy_url;
-      byID('diagnostic-log-enabled').checked = config.diagnostic_log_enabled === true;
       Object.keys(numberIDs).forEach(function (key) { byID(numberIDs[key]).value = config[key]; });
       accounts = config.accounts.map(mergeHostAccountMetadata);
       renderAccounts();
@@ -465,8 +467,7 @@
         enabled: byID('enabled').checked,
         upstream_proxy_id: selectedProxyID === null ? NaN : selectedProxyID,
         upstream_proxy_url: upstreamProxyURL,
-        dynamic_proxy_url: byID('dynamic-proxy-url').value.trim(),
-        diagnostic_log_enabled: byID('diagnostic-log-enabled').checked
+        dynamic_proxy_url: byID('dynamic-proxy-url').value.trim()
       };
       Object.keys(numberIDs).forEach(function (key) {
         const raw = byID(numberIDs[key]).value.trim();
@@ -509,12 +510,13 @@
       });
       byID('tickets-empty').hidden = status.tickets.length !== 0;
       lastDiagnostics = status.diagnostics.slice();
+      diagnosticsListening = status.diagnostics_listening;
       renderDiagnostics();
     }
     function renderDiagnostics() {
       const body = byID('diagnostics-body');
       body.replaceChildren();
-      lastDiagnostics.forEach(function (event) {
+      lastDiagnostics.slice().reverse().forEach(function (event) {
         const row = element('tr');
         row.appendChild(element('td', event.time ? new Date(event.time).toLocaleString('zh-CN') : '—'));
         const accountModel = element('td');
@@ -539,7 +541,15 @@
         body.appendChild(row);
       });
       byID('diagnostics-empty').hidden = lastDiagnostics.length !== 0;
-      byID('diagnostics-summary').textContent = lastDiagnostics.length ? '最近 ' + lastDiagnostics.length + ' 条记录，票据原文与凭据不会显示。' : '暂无诊断记录。';
+      if (!diagnosticsOpen) {
+        byID('diagnostics-summary').textContent = '打开面板后开始实时监听，不保存日志。';
+      } else if (!diagnosticsListening) {
+        byID('diagnostics-summary').textContent = '正在建立实时监听…';
+      } else if (lastDiagnostics.length) {
+        byID('diagnostics-summary').textContent = '实时监听中 · 最近 ' + lastDiagnostics.length + ' 条，新事件置顶，不保存。';
+      } else {
+        byID('diagnostics-summary').textContent = '正在监听，等待新事件；关闭面板即停止。';
+      }
     }
     async function refreshStatus() {
       if (closed || statusBusy || !bridge) return;
@@ -608,11 +618,35 @@
       finally { if (!closed) setBusy(false); }
     });
     byID('refresh-status').addEventListener('click', refreshStatus);
+    async function startDiagnosticsListening() {
+      diagnosticsOpen = true;
+      lastDiagnostics = [];
+      byID('diagnostics-summary').textContent = '正在建立实时监听…';
+      renderDiagnostics();
+      await refreshStatus();
+      if (!diagnosticsOpen || closed) return;
+      // A short burst of close status polls opens the engine's listener
+      // without adding a custom host bridge method.
+      await refreshStatus();
+      if (!diagnosticsOpen || closed) return;
+      await refreshStatus();
+      if (!diagnosticsOpen || closed) return;
+      global.clearInterval(diagnosticsTimer);
+      diagnosticsTimer = global.setInterval(refreshStatus, 500);
+    }
+    function stopDiagnosticsListening() {
+      diagnosticsOpen = false;
+      diagnosticsListening = false;
+      global.clearInterval(diagnosticsTimer);
+      diagnosticsTimer = undefined;
+      lastDiagnostics = [];
+      renderDiagnostics();
+    }
     byID('open-diagnostics').addEventListener('click', async function () {
       const dialog = byID('diagnostics-dialog');
       if (typeof dialog.showModal === 'function') dialog.showModal();
       else dialog.hidden = false;
-      await refreshStatus();
+      await startDiagnosticsListening();
     });
     byID('diagnostics-refresh').addEventListener('click', refreshStatus);
     byID('diagnostics-close').addEventListener('click', function () {
@@ -620,11 +654,12 @@
       if (typeof dialog.close === 'function') dialog.close();
       else dialog.hidden = true;
     });
+    byID('diagnostics-dialog').addEventListener('close', stopDiagnosticsListening);
     byID('diagnostics-copy').addEventListener('click', async function () {
       if (diagnosticsBusy) return;
       diagnosticsBusy = true;
       try {
-        const text = lastDiagnostics.map(function (event) {
+        const text = lastDiagnostics.slice().reverse().map(function (event) {
           return [event.time, event.account_id ? '#' + event.account_id : '', event.model, diagnosticStageLabel(event.stage),
             [event.upstream_proxy, event.target_proxy].filter(Boolean).join(' -> '), 'capture=' + (event.capture_egress || 'unknown'),
             'fixed=' + (event.fixed_egress || 'unknown'), 'state=' + (event.state_class || 'unknown'), 'response=' + (event.response_model || 'unknown'),
@@ -640,6 +675,7 @@
     function stop() {
       if (closed) return;
       closed = true; global.clearInterval(pollTimer);
+      stopDiagnosticsListening();
       if (resizeObserver) resizeObserver.disconnect();
       if (bridge) bridge.dispose();
       global.removeEventListener('pagehide', stop);

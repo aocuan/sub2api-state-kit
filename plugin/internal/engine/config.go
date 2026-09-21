@@ -14,7 +14,7 @@ import (
 )
 
 const PluginID = "io.github.wangyunjeff.sub2api-state-kit"
-const Version = "0.3.6"
+const Version = "0.3.7"
 const StateHeader = "x-codex-turn-state"
 const namespace = "state-kit-v1"
 
@@ -25,11 +25,14 @@ const (
 
 // Config contains no OAuth credentials. The host owns credential refresh.
 type Config struct {
-	Enabled                bool            `json:"enabled"`
-	UpstreamProxyID        int64           `json:"upstream_proxy_id"`
-	UpstreamProxyURL       string          `json:"upstream_proxy_url"`
-	DynamicProxyURL        string          `json:"dynamic_proxy_url"`
-	DiagnosticLogEnabled   bool            `json:"diagnostic_log_enabled"`
+	Enabled          bool   `json:"enabled"`
+	UpstreamProxyID  int64  `json:"upstream_proxy_id"`
+	UpstreamProxyURL string `json:"upstream_proxy_url"`
+	DynamicProxyURL  string `json:"dynamic_proxy_url"`
+	// DiagnosticLogEnabled is retained only so configurations saved by v0.3.6
+	// remain loadable. Diagnostics are now a UI-scoped live listener and the
+	// value is intentionally ignored.
+	DiagnosticLogEnabled   bool            `json:"diagnostic_log_enabled,omitempty"`
 	TTLMinutes             int             `json:"ttl_minutes"`
 	RefreshBeforeMinutes   int             `json:"refresh_before_minutes"`
 	MaxAttempts            int             `json:"max_attempts"`

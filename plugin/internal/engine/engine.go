@@ -42,6 +42,9 @@ type Engine struct {
 	revoked          map[string]string
 	diagnostics      []diagnosticEvent
 	diagnosticSeq    uint64
+	diagnosticPollAt time.Time
+	diagnosticBurst  int
+	diagnosticUntil  time.Time
 	semaphore        chan struct{}
 	clients          *clientPool
 	probeURL         string
@@ -83,13 +86,14 @@ type statusTicket struct {
 	Attempts         int    `json:"attempts"`
 }
 type statusSnapshot struct {
-	HostReady          bool              `json:"host_ready"`
-	AccountIDs         []int64           `json:"account_ids"`
-	AccountCatalog     []statusAccount   `json:"account_catalog"`
-	Tickets            []statusTicket    `json:"tickets"`
-	DiagnosticsEnabled bool              `json:"diagnostics_enabled"`
-	Diagnostics        []diagnosticEvent `json:"diagnostics,omitempty"`
-	Message            string            `json:"message"`
+	HostReady            bool              `json:"host_ready"`
+	AccountIDs           []int64           `json:"account_ids"`
+	AccountCatalog       []statusAccount   `json:"account_catalog"`
+	Tickets              []statusTicket    `json:"tickets"`
+	DiagnosticsEnabled   bool              `json:"diagnostics_enabled"`
+	DiagnosticsListening bool              `json:"diagnostics_listening"`
+	Diagnostics          []diagnosticEvent `json:"diagnostics,omitempty"`
+	Message              string            `json:"message"`
 }
 type statusAccount struct {
 	AccountID int64  `json:"account_id"`
@@ -171,7 +175,9 @@ func (e *Engine) GetInfo(context.Context, *pluginv1.GetInfoRequest) (*pluginv1.G
 func (e *Engine) Health(context.Context, *pluginv1.HealthRequest) (*pluginv1.HealthResponse, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	s := e.snapshotLocked(time.Now())
+	now := time.Now()
+	e.observeDiagnosticPollLocked(now)
+	s := e.snapshotLocked(now)
 	return &pluginv1.HealthResponse{Healthy: !e.closed, Message: s.Message, StatusJson: jsonText(s)}, nil
 }
 func (e *Engine) ValidateConfig(_ context.Context, r *pluginv1.ValidateConfigRequest) (*pluginv1.ValidateConfigResponse, error) {
@@ -391,8 +397,9 @@ func (e *Engine) notify() {
 	}
 }
 func (e *Engine) snapshotLocked(now time.Time) statusSnapshot {
-	s := statusSnapshot{HostReady: e.hostReady, AccountIDs: []int64{}, AccountCatalog: []statusAccount{}, Tickets: []statusTicket{}, DiagnosticsEnabled: e.config.DiagnosticLogEnabled, Message: "STATE disabled; requests use the account business proxy"}
-	if e.config.DiagnosticLogEnabled && len(e.diagnostics) > 0 {
+	listening := e.diagnosticsListeningLocked(now)
+	s := statusSnapshot{HostReady: e.hostReady, AccountIDs: []int64{}, AccountCatalog: []statusAccount{}, Tickets: []statusTicket{}, DiagnosticsEnabled: listening, DiagnosticsListening: listening, Message: "STATE disabled; requests use the account business proxy"}
+	if listening && len(e.diagnostics) > 0 {
 		s.Diagnostics = append([]diagnosticEvent(nil), e.diagnostics...)
 	}
 	for id := range e.directory {
