@@ -5,13 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>STATE Kit 账号管理</title>
   <link rel="stylesheet" href="assets/styles.css">
+  <link rel="stylesheet" href="assets/account-egress.css">
+  <link rel="stylesheet" href="assets/diagnostics.css">
   <script src="assets/bridge-v1.js" defer></script>
   <script src="assets/app.js" defer></script>
 </head>
 <body>
   <main class="shell">
     <header class="page-head">
-      <div><p class="eyebrow">Sub2API 插件</p><h1>STATE Kit 账号管理</h1><p class="muted">动态代理获取票据，业务请求继续使用账号原有代理。</p></div>
+      <div><p class="eyebrow">Sub2API 插件</p><h1>STATE Kit 账号管理</h1><p class="muted">每个账号可选择沿用 Sub2 原有代理，或由插件使用固定会话代理接管出口。</p></div>
       <span id="connection-status" class="badge">正在连接宿主</span>
     </header>
 
@@ -26,7 +28,7 @@
           </div>
           <label for="upstream-proxy-id">第一层：IP 管理代理</label>
           <select id="upstream-proxy-id"><option value="0">不使用第一层，动态代理直连</option></select>
-          <p id="upstream-proxy-help" class="help">从 IP 管理中选择一台可连接国外站点的代理；动态采集会先经过它，再连接下面的动态代理。</p>
+          <p id="upstream-proxy-help" class="help">从 IP 管理中选择一台可连接国外站点的代理；采集和账号级插件出口都会先经过它，再连接第二层代理。</p>
           <label for="dynamic-proxy-url">第二层：动态代理地址</label>
           <div class="input-action"><input id="dynamic-proxy-url" type="password" autocomplete="off" spellcheck="false" placeholder="填写动态代理地址"><button id="toggle-proxy" type="button" class="secondary" aria-controls="dynamic-proxy-url" aria-pressed="false">显示</button></div>
           <p class="help">支持 HTTP、HTTPS、SOCKS5 和 SOCKS5H。地址中的 <code>{random}</code> 或 <code>{sid}</code> 在每次尝试时替换为随机会话值。请填写自己的代理，不在此处填写账号 Token。</p>
@@ -41,8 +43,9 @@
             <button id="add-account" type="button" class="secondary">添加账号</button>
           </div>
           <p id="account-discovery" class="help">名称、邮箱、到期时间和额度会从账号管理同步；同步不可用时仅显示账号 ID。</p>
-          <div class="table-wrap"><table class="accounts-table"><thead><tr><th scope="col">账号 ID</th><th scope="col">账号资料</th><th scope="col">开关</th><th scope="col">套餐 / 票据</th><th scope="col">模型</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead><tbody id="accounts-body"></tbody></table></div>
-          <p id="accounts-empty" class="empty">尚未添加账号。添加后选择套餐、填写模型，再手动开启。</p>
+          <div class="table-wrap"><table class="accounts-table"><thead><tr><th scope="col">账号 ID</th><th scope="col">账号资料</th><th scope="col">开关</th><th scope="col">出口模式</th><th scope="col">账号粘性代理</th><th scope="col">套餐 / 票据</th><th scope="col">模型</th><th scope="col"><span class="sr-only">操作</span></th></tr></thead><tbody id="accounts-body"></tbody></table></div>
+          <p id="accounts-empty" class="empty">尚未添加账号。添加后选择出口模式、套餐和模型，再手动开启。</p>
+          <p class="help">Sub2 原有代理保持宿主行为；插件固定出口使用账号粘性代理完成采集、复验和业务转发。粘性代理须填写服务商固定 session，不接受 <code>{random}</code> 或 <code>{sid}</code>；从聊天复制的 <code>\@</code> 请改成普通 <code>@</code>。若服务商不按 session 保持出口，需要改用服务商 API；SOCKS5 本身不能指定任意出口 IP。</p>
           <p class="help">Pro 对应 292，Team 对应 332。模型框可从常用模型中选择，也可直接输入自定义名称；多个模型用英文逗号分隔。</p>
           <datalist id="model-options"><option value="gpt-6-astra"></option><option value="gpt-5.6-sol"></option><option value="gpt-5.6-terra"></option><option value="gpt-5.6-luna"></option><option value="gpt-5.5"></option></datalist>
         </section>
@@ -56,6 +59,8 @@
             <div><label for="attempt-interval-seconds">尝试间隔（秒）</label><input id="attempt-interval-seconds" type="number" min="1" max="300" value="10" required></div>
             <div><label for="cooldown-seconds">失败后冷却（秒）</label><input id="cooldown-seconds" type="number" min="30" max="3600" value="300" required></div>
           </div>
+          <label class="switch-label diagnostic-switch"><input id="diagnostic-log-enabled" type="checkbox" role="switch"><span>记录诊断日志</span></label>
+          <p class="help">开启后记录采集出口、固定业务出口、292/312/332 状态长度、响应模型和结果。日志仅保存在插件进程内，最多 240 条，不记录票据原文或凭据。</p>
           <p class="help">有效期是本地使用上限，上游可能提前使票据失效。提前续期必须小于有效期。</p>
         </details>
       </fieldset>
@@ -65,11 +70,19 @@
     </form>
 
     <section class="card status-card" aria-labelledby="tickets-title">
-      <div class="section-heading"><div><h2 id="tickets-title">运行状态</h2><p id="status-summary" class="muted">正在读取状态…</p></div><button id="refresh-status" type="button" class="secondary" disabled>刷新状态</button></div>
+      <div class="section-heading"><div><h2 id="tickets-title">运行状态</h2><p id="status-summary" class="muted">正在读取状态…</p></div><div class="actions"><button id="open-diagnostics" type="button" class="secondary" disabled>查看诊断日志</button><button id="refresh-status" type="button" class="secondary" disabled>刷新状态</button></div></div>
       <div class="table-wrap"><table><thead><tr><th scope="col">账号 / 模型</th><th scope="col">套餐</th><th scope="col">状态</th><th scope="col">剩余时间</th><th scope="col">最近情况</th></tr></thead><tbody id="tickets-body"></tbody></table></div>
       <p id="tickets-empty" class="empty">暂无票据状态。</p>
       <p class="help">每 10 秒只读刷新，不显示票据原文。配置表单中的未保存修改会保留。</p>
     </section>
   </main>
+  <dialog id="diagnostics-dialog" class="diagnostics-dialog" aria-labelledby="diagnostics-title">
+    <div class="diagnostics-head">
+      <div><h2 id="diagnostics-title">诊断日志</h2><p id="diagnostics-summary" class="muted">正在读取日志…</p></div>
+      <div class="actions"><button id="diagnostics-refresh" type="button" class="secondary">刷新</button><button id="diagnostics-copy" type="button" class="secondary">复制</button><button id="diagnostics-close" type="button" class="secondary">关闭</button></div>
+    </div>
+    <div class="table-wrap diagnostics-table"><table><thead><tr><th scope="col">时间</th><th scope="col">账号 / 模型</th><th scope="col">阶段</th><th scope="col">代理链</th><th scope="col">出口 IP</th><th scope="col">状态</th><th scope="col">响应</th><th scope="col">结果</th><th scope="col">耗时</th></tr></thead><tbody id="diagnostics-body"></tbody></table></div>
+    <p id="diagnostics-empty" class="empty">暂无诊断记录。请先在高级参数中开启并保存。</p>
+  </dialog>
 </body>
 </html>

@@ -5,7 +5,7 @@
   else api.start(global);
 })(typeof window === 'object' ? window : null, function () {
   'use strict';
-  const DEFAULT_CONFIG = Object.freeze({ enabled: false, upstream_proxy_id: 0, upstream_proxy_url: '', dynamic_proxy_url: '', ttl_minutes: 60,
+  const DEFAULT_CONFIG = Object.freeze({ enabled: false, upstream_proxy_id: 0, upstream_proxy_url: '', dynamic_proxy_url: '', diagnostic_log_enabled: false, ttl_minutes: 60,
     refresh_before_minutes: 10, max_attempts: 8, attempt_interval_seconds: 10, cooldown_seconds: 300 });
   const NUMBERS = Object.freeze({ ttl_minutes: [1, 60, '票据有效期'], refresh_before_minutes: [0, 59, '提前续期'],
     max_attempts: [1, 32, '每轮最多尝试'], attempt_interval_seconds: [1, 300, '尝试间隔'], cooldown_seconds: [30, 3600, '失败后冷却'] });
@@ -17,7 +17,8 @@
   const ACCOUNT_TEXT_LIMITS = Object.freeze({ name: 120, email: 254, expires_at: 64, quota: 80 });
   const ERRORS = Object.freeze({ attempts_exhausted: '本轮尝试已用完', identity_unavailable: '暂时无法取得账号授权或业务代理',
     invalid_dynamic_proxy: '动态代理配置无效', harvest_failed: '动态代理获取票据未成功', unexpected_state_length: '票据长度与所选套餐不符',
-    identity_changed: '账号授权信息发生变化', fixed_proxy_validation_failed: '票据未通过原业务代理验证',
+    identity_changed: '账号授权信息发生变化', account_egress_invalid: '账号出口代理配置无效',
+    fixed_proxy_validation_failed: '票据未通过账号业务代理验证', sticky_egress_changed: '账号粘性代理出口发生变化',
     ticket_persistence_failed: '票据保存失败', upstream_unauthorized: '上游拒绝授权（401）', upstream_forbidden: '上游拒绝访问（403）',
     upstream_rate_limited: '上游限流（429）', upstream_rejected: '上游拒绝请求', model_mismatch: '返回模型不匹配，正在重新获取票据',
     state_312: '收到 312 状态，正在重新获取票据', model_mismatch_persistence_failed: '返回模型不匹配，票据失效记录保存失败',
@@ -97,6 +98,7 @@
       return { account_id: account.account_id, name: accountText(account.name, 'name'),
         email: accountText(account.email, 'email'), expires_at: accountText(account.expires_at, 'expires_at'),
         quota: accountText(account.quota, 'quota'), enabled: account.enabled === true,
+        egress_mode: account.egress_mode || 'sub2', sticky_proxy_url: accountText(account.sticky_proxy_url, 'sticky_proxy_url'),
         plan: account.plan || 'pro', models: Array.isArray(account.models) ? account.models.slice() : ['gpt-6-astra'] };
     }) : [];
     return config;
@@ -106,6 +108,7 @@
     if (proxyID(config.upstream_proxy_id) === null) throw new Error('第一层代理编号格式不正确。');
     validateProxyAddress(config.upstream_proxy_url, '第一层代理');
     validateProxyAddress(config.dynamic_proxy_url, '动态代理');
+    if (typeof config.diagnostic_log_enabled !== 'boolean') throw new Error('诊断日志开关格式不正确。');
     Object.keys(NUMBERS).forEach(function (key) {
       const bounds = NUMBERS[key];
       if (!Number.isInteger(config[key]) || config[key] < bounds[0] || config[key] > bounds[1]) {
@@ -125,6 +128,12 @@
       account.expires_at = validateAccountText(account.expires_at, '账号到期时间', 'expires_at');
       account.quota = validateAccountText(account.quota, '账号额度', 'quota');
       if (typeof account.enabled !== 'boolean') throw new Error('账号开关格式不正确。');
+      if (!['sub2', 'plugin'].includes(account.egress_mode)) throw new Error('请选择 Sub2 原有代理或插件固定出口。');
+      validateProxyAddress(account.sticky_proxy_url, '账号粘性代理');
+      if (account.egress_mode === 'plugin') {
+        if (!account.sticky_proxy_url) throw new Error('插件固定出口模式必须填写账号粘性代理。');
+        if (/\{(?:random|sid)\}/i.test(account.sticky_proxy_url)) throw new Error('账号粘性代理必须使用服务商固定 session，不能使用 {random} 或 {sid}。');
+      }
       if (!['pro', 'team'].includes(account.plan)) throw new Error('请选择 Pro 或 Team 套餐。');
       if (!Array.isArray(account.models) || !account.models.length || account.models.length > 16) throw new Error('每个账号须填写 1–16 个模型。');
       totalModels += account.models.length;
@@ -136,8 +145,8 @@
       });
     });
     if (totalModels > 1024) throw new Error('最多配置 1024 个账号与模型组合。');
-    if (config.enabled && config.accounts.some(function (account) { return account.enabled; }) && !config.dynamic_proxy_url) {
-      throw new Error('启用账号前，请填写动态代理地址。');
+    if (config.enabled && config.accounts.some(function (account) { return account.enabled && account.egress_mode === 'sub2'; }) && !config.dynamic_proxy_url) {
+      throw new Error('启用 Sub2 原有代理模式的账号前，请填写动态代理地址。');
     }
     if (config.upstream_proxy_id > 0 && !config.upstream_proxy_url) {
       throw new Error('所选第一层代理缺少可用的代理地址。');
@@ -146,6 +155,48 @@
   }
   function stateLabel(state) { return Object.prototype.hasOwnProperty.call(STATES, state) ? STATES[state] : ['未知状态', 'warning']; }
   function errorLabel(code) { return Object.prototype.hasOwnProperty.call(ERRORS, code) ? ERRORS[code] : '操作未完成，请检查账号与插件设置。'; }
+  function diagnosticStageLabel(stage) {
+    return ({ capture: '采集票据', fixed_validation: '固定代理复验', restore: '恢复复验',
+      ticket_lookup: '票据查询', business: '业务请求', business_result: '业务结果' })[stage] || '未知阶段';
+  }
+  function diagnosticOutcomeLabel(outcome) {
+    return ({ accepted: '已接受', probe_failed: '探测失败', unexpected_state: '状态长度不符',
+      validation_failed: '固定代理复验失败', state_312: '收到 312', unavailable: '票据未准备好',
+      invalid_proxy: '代理配置无效', headers_received: '已收到响应头', model_match: '模型一致',
+      model_mismatch: '模型不一致', incomplete: '响应未完成', upstream_read_error: '响应中断',
+      upstream_transport: '传输失败', upstream_transport_dns: 'DNS 失败', upstream_transport_connect: '连接失败',
+      upstream_transport_tls: 'TLS 失败', upstream_transport_timeout: '传输超时', upstream_transport_reset: '连接重置',
+      egress_changed: '出口 IP 不一致' })[outcome] || '未知结果';
+  }
+  function safeDiagnosticText(value, max) {
+    if (typeof value !== 'string') return '';
+    return redactError(value.trim()).slice(0, max);
+  }
+  function normalizeDiagnostic(event) {
+    if (!event || typeof event !== 'object' || Array.isArray(event)) return null;
+    const stateClasses = new Set(['292', '312', '332', 'empty', 'other']);
+    const responseModel = typeof event.response_model === 'string' && MODEL_PATTERN.test(event.response_model) ? event.response_model : '';
+    return {
+      seq: Number.isSafeInteger(event.seq) && event.seq >= 0 ? event.seq : 0,
+      time: typeof event.time === 'string' && Number.isFinite(Date.parse(event.time)) ? event.time : '',
+      account_id: event.account_id === undefined ? null : accountID(event.account_id),
+      model: typeof event.model === 'string' && MODEL_PATTERN.test(event.model) ? event.model : '',
+      stage: safeDiagnosticText(event.stage, 40),
+      attempt: Number.isSafeInteger(event.attempt) && event.attempt > 0 ? event.attempt : 0,
+      upstream_proxy: safeDiagnosticText(event.upstream_proxy, 160),
+      target_proxy: safeDiagnosticText(event.target_proxy, 160),
+      capture_egress: safeDiagnosticText(event.capture_egress, 64),
+      fixed_egress: safeDiagnosticText(event.fixed_egress, 64),
+      egress_match: typeof event.egress_match === 'boolean' ? event.egress_match : null,
+      state_length: Number.isSafeInteger(event.state_length) && event.state_length >= 0 && event.state_length <= 8192 ? event.state_length : 0,
+      state_class: stateClasses.has(event.state_class) ? event.state_class : '',
+      response_model: responseModel,
+      http_status: Number.isSafeInteger(event.http_status) && event.http_status >= 100 && event.http_status <= 599 ? event.http_status : 0,
+      outcome: safeDiagnosticText(event.outcome, 64),
+      error: safeDiagnosticText(event.error, 80),
+      duration_ms: Number.isSafeInteger(event.duration_ms) && event.duration_ms >= 0 ? event.duration_ms : 0
+    };
+  }
   function redactError(value) {
     return String(value || '')
       .replace(/(?:https?|socks5h?):\/\/[^\s/]*@/gi, '[代理凭据已隐藏]@')
@@ -169,6 +220,8 @@
       account_ids: Array.isArray(status.account_ids) ? Array.from(new Set(status.account_ids.map(accountID).filter(function (id) { return id !== null; }))).sort(function (a, b) { return a - b; }) : [],
       account_catalog: catalog,
       tickets: Array.isArray(status.tickets) ? status.tickets.filter(function (ticket) { return ticket && accountID(ticket.account_id) !== null; }).slice(0, 4096) : [],
+      diagnostics_enabled: status.diagnostics_enabled === true,
+      diagnostics: Array.isArray(status.diagnostics) ? status.diagnostics.map(normalizeDiagnostic).filter(Boolean).slice(-240) : [],
       message: redactError(MESSAGES[status.message] || status.message || result && result.message || '') };
   }
   function remainingText(seconds) {
@@ -186,12 +239,14 @@
     let busy = false;
     let dirty = false;
     let statusBusy = false;
+    let diagnosticsBusy = false;
     let closed = false;
     let pollTimer;
     let resizeObserver;
     let accounts = [];
     let hostAccountCatalog = [];
     let statusAccountCatalog = [];
+    let lastDiagnostics = [];
     let proxies = [];
     let savedUpstreamProxyID = 0;
     let savedUpstreamProxyURL = '';
@@ -219,6 +274,7 @@
       byID('config-fields').disabled = !loaded || busy;
       byID('save-config').disabled = !loaded || busy;
       byID('test-config').disabled = !loaded || busy;
+      byID('open-diagnostics').disabled = !loaded;
     }
     function renderAccounts() {
       const body = byID('accounts-body');
@@ -260,6 +316,33 @@
         enabled.setAttribute('aria-label', '启用账号 ' + account.account_id);
         enabled.addEventListener('change', function () { account.enabled = enabled.checked; markDirty(); });
         enabledCell.appendChild(enabled); row.appendChild(enabledCell);
+
+        const egressCell = element('td');
+        const egressMode = element('select');
+        egressMode.setAttribute('aria-label', '账号 ' + account.account_id + ' 的出口模式');
+        [['sub2', 'Sub2 原有代理'], ['plugin', '插件固定出口']].forEach(function (entry) {
+          const option = element('option', entry[1]); option.value = entry[0]; egressMode.appendChild(option);
+        });
+        egressMode.value = account.egress_mode;
+        egressCell.appendChild(egressMode); row.appendChild(egressCell);
+
+        const stickyCell = element('td');
+        const sticky = element('input');
+        sticky.type = 'password';
+        sticky.value = account.sticky_proxy_url || '';
+        sticky.placeholder = 'socks5h://user-session-...:pass@host:port';
+        sticky.autocomplete = 'new-password';
+        sticky.spellcheck = false;
+        sticky.disabled = account.egress_mode !== 'plugin';
+        sticky.setAttribute('aria-label', '账号 ' + account.account_id + ' 的账号粘性代理');
+        sticky.addEventListener('input', function () { account.sticky_proxy_url = sticky.value.trim(); markDirty(); });
+        egressMode.addEventListener('change', function () {
+          account.egress_mode = egressMode.value;
+          sticky.disabled = account.egress_mode !== 'plugin';
+          markDirty();
+        });
+        stickyCell.appendChild(sticky); row.appendChild(stickyCell);
+
         const planCell = element('td');
         const plan = element('select'); plan.setAttribute('aria-label', '账号 ' + account.account_id + ' 的套餐');
         [['pro', 'Pro · 292'], ['team', 'Team · 332']].forEach(function (entry) {
@@ -362,6 +445,7 @@
       savedUpstreamProxyURL = config.upstream_proxy_url;
       renderProxyOptions(savedUpstreamProxyID);
       byID('dynamic-proxy-url').value = config.dynamic_proxy_url;
+      byID('diagnostic-log-enabled').checked = config.diagnostic_log_enabled === true;
       Object.keys(numberIDs).forEach(function (key) { byID(numberIDs[key]).value = config[key]; });
       accounts = config.accounts.map(mergeHostAccountMetadata);
       renderAccounts();
@@ -381,7 +465,8 @@
         enabled: byID('enabled').checked,
         upstream_proxy_id: selectedProxyID === null ? NaN : selectedProxyID,
         upstream_proxy_url: upstreamProxyURL,
-        dynamic_proxy_url: byID('dynamic-proxy-url').value.trim()
+        dynamic_proxy_url: byID('dynamic-proxy-url').value.trim(),
+        diagnostic_log_enabled: byID('diagnostic-log-enabled').checked
       };
       Object.keys(numberIDs).forEach(function (key) {
         const raw = byID(numberIDs[key]).value.trim();
@@ -390,7 +475,8 @@
       config.accounts = accounts.map(function (account) { return {
         account_id: account.account_id, name: accountText(account.name, 'name'), email: accountText(account.email, 'email'),
         expires_at: accountText(account.expires_at, 'expires_at'), quota: accountText(account.quota, 'quota'),
-        enabled: account.enabled, plan: account.plan, models: account.models.slice()
+        enabled: account.enabled, egress_mode: account.egress_mode, sticky_proxy_url: account.sticky_proxy_url,
+        plan: account.plan, models: account.models.slice()
       }; });
       return validateConfig(config);
     }
@@ -422,6 +508,38 @@
         row.appendChild(detail); body.appendChild(row);
       });
       byID('tickets-empty').hidden = status.tickets.length !== 0;
+      lastDiagnostics = status.diagnostics.slice();
+      renderDiagnostics();
+    }
+    function renderDiagnostics() {
+      const body = byID('diagnostics-body');
+      body.replaceChildren();
+      lastDiagnostics.forEach(function (event) {
+        const row = element('tr');
+        row.appendChild(element('td', event.time ? new Date(event.time).toLocaleString('zh-CN') : '—'));
+        const accountModel = element('td');
+        accountModel.appendChild(element('span', event.account_id ? '#' + event.account_id : '—', 'status-account'));
+        accountModel.appendChild(element('span', event.model || '—', 'status-model'));
+        row.appendChild(accountModel);
+        const stage = element('td', diagnosticStageLabel(event.stage));
+        if (event.attempt) stage.appendChild(element('div', '第 ' + event.attempt + ' 次', 'diagnostic-sub'));
+        row.appendChild(stage);
+        row.appendChild(element('td', [event.upstream_proxy, event.target_proxy].filter(Boolean).join(' → ') || '—', 'diagnostic-mono'));
+        const egress = element('td', '采集：' + (event.capture_egress || '未知') + '\n固定：' + (event.fixed_egress || '未知'), 'diagnostic-mono');
+        if (event.egress_match === true) egress.appendChild(element('span', '出口一致', 'badge success'));
+        else if (event.egress_match === false) egress.appendChild(element('span', '出口不一致', 'badge warning'));
+        row.appendChild(egress);
+        row.appendChild(element('td', (event.state_class || '—') + (event.state_length ? ' · ' + event.state_length : '')));
+        row.appendChild(element('td', (event.http_status ? event.http_status + ' · ' : '') + (event.response_model || '—'), 'diagnostic-mono'));
+        const outcome = element('td');
+        outcome.appendChild(element('span', diagnosticOutcomeLabel(event.outcome), event.outcome === 'accepted' || event.outcome === 'model_match' ? 'badge success' : event.outcome === 'model_mismatch' || event.outcome === 'state_312' || event.outcome === 'validation_failed' ? 'badge warning' : 'badge'));
+        if (event.error) outcome.appendChild(element('div', event.error, 'diagnostic-sub'));
+        row.appendChild(outcome);
+        row.appendChild(element('td', event.duration_ms ? event.duration_ms + ' ms' : '—'));
+        body.appendChild(row);
+      });
+      byID('diagnostics-empty').hidden = lastDiagnostics.length !== 0;
+      byID('diagnostics-summary').textContent = lastDiagnostics.length ? '最近 ' + lastDiagnostics.length + ' 条记录，票据原文与凭据不会显示。' : '暂无诊断记录。';
     }
     async function refreshStatus() {
       if (closed || statusBusy || !bridge) return;
@@ -465,7 +583,7 @@
       if (accounts.length >= 256) { notice('最多配置 256 个账号。', 'error'); return; }
       const metadata = accountMetadataByID(id);
       accounts.push({ account_id: id, name: metadata.name, email: metadata.email, expires_at: metadata.expires_at,
-        quota: metadata.quota, enabled: false, plan: 'pro', models: ['gpt-6-astra'] });
+        quota: metadata.quota, enabled: false, egress_mode: 'sub2', sticky_proxy_url: '', plan: 'pro', models: ['gpt-6-astra'] });
       renderAccounts(); markDirty(); byID('new-account-id').value = ''; byID('manual-account-id').value = '';
       notice('已添加账号 ' + id + '，默认关闭。补全账号资料、选择套餐和模型后，可手动开启并保存。');
     });
@@ -490,6 +608,34 @@
       finally { if (!closed) setBusy(false); }
     });
     byID('refresh-status').addEventListener('click', refreshStatus);
+    byID('open-diagnostics').addEventListener('click', async function () {
+      const dialog = byID('diagnostics-dialog');
+      if (typeof dialog.showModal === 'function') dialog.showModal();
+      else dialog.hidden = false;
+      await refreshStatus();
+    });
+    byID('diagnostics-refresh').addEventListener('click', refreshStatus);
+    byID('diagnostics-close').addEventListener('click', function () {
+      const dialog = byID('diagnostics-dialog');
+      if (typeof dialog.close === 'function') dialog.close();
+      else dialog.hidden = true;
+    });
+    byID('diagnostics-copy').addEventListener('click', async function () {
+      if (diagnosticsBusy) return;
+      diagnosticsBusy = true;
+      try {
+        const text = lastDiagnostics.map(function (event) {
+          return [event.time, event.account_id ? '#' + event.account_id : '', event.model, diagnosticStageLabel(event.stage),
+            [event.upstream_proxy, event.target_proxy].filter(Boolean).join(' -> '), 'capture=' + (event.capture_egress || 'unknown'),
+            'fixed=' + (event.fixed_egress || 'unknown'), 'state=' + (event.state_class || 'unknown'), 'response=' + (event.response_model || 'unknown'),
+            'outcome=' + event.outcome, event.error].filter(Boolean).join('\t');
+        }).join('\n');
+        if (global.navigator && global.navigator.clipboard && global.navigator.clipboard.writeText) await global.navigator.clipboard.writeText(text);
+        notice(text ? '诊断日志已复制。' : '当前没有可复制的诊断日志。', text ? 'success' : undefined);
+      } catch (error) {
+        notice('复制诊断日志失败：' + error.message, 'error');
+      } finally { diagnosticsBusy = false; }
+    });
     function resize() { try { bridge.resize(document.documentElement.scrollHeight); } catch (_) { /* Context may already be closed. */ } }
     function stop() {
       if (closed) return;
@@ -529,5 +675,6 @@
   }
   return { DEFAULT_CONFIG: DEFAULT_CONFIG, normalizeConfig: normalizeConfig, validateConfig: validateConfig,
     accountID: accountID, accountOptionLabel: accountOptionLabel, normalizeAccountCatalog: normalizeAccountCatalog,
-    parseStatus: parseStatus, stateLabel: stateLabel, errorLabel: errorLabel, redactError: redactError, remainingText: remainingText, start: start };
+    parseStatus: parseStatus, stateLabel: stateLabel, errorLabel: errorLabel, redactError: redactError, remainingText: remainingText,
+    diagnosticStageLabel: diagnosticStageLabel, diagnosticOutcomeLabel: diagnosticOutcomeLabel, start: start };
 });

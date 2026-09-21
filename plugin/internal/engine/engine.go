@@ -40,6 +40,8 @@ type Engine struct {
 	records          map[string]*jobRecord
 	jobs             map[string]uint64
 	revoked          map[string]string
+	diagnostics      []diagnosticEvent
+	diagnosticSeq    uint64
 	semaphore        chan struct{}
 	clients          *clientPool
 	probeURL         string
@@ -66,6 +68,7 @@ type ticket struct {
 }
 type receipt struct {
 	State, Version, Key, ConfigFingerprint string
+	TargetProxyURL, UpstreamProxyURL       string
 	Generation                             uint64
 }
 type statusTicket struct {
@@ -80,11 +83,13 @@ type statusTicket struct {
 	Attempts         int    `json:"attempts"`
 }
 type statusSnapshot struct {
-	HostReady      bool            `json:"host_ready"`
-	AccountIDs     []int64         `json:"account_ids"`
-	AccountCatalog []statusAccount `json:"account_catalog"`
-	Tickets        []statusTicket  `json:"tickets"`
-	Message        string          `json:"message"`
+	HostReady          bool              `json:"host_ready"`
+	AccountIDs         []int64           `json:"account_ids"`
+	AccountCatalog     []statusAccount   `json:"account_catalog"`
+	Tickets            []statusTicket    `json:"tickets"`
+	DiagnosticsEnabled bool              `json:"diagnostics_enabled"`
+	Diagnostics        []diagnosticEvent `json:"diagnostics,omitempty"`
+	Message            string            `json:"message"`
 }
 type statusAccount struct {
 	AccountID int64  `json:"account_id"`
@@ -203,6 +208,7 @@ func (e *Engine) ApplyConfig(_ context.Context, r *pluginv1.ApplyConfigRequest) 
 	e.activeAfter = time.Now().Add(e.warmup)
 	e.jobs = map[string]uint64{}
 	e.records = map[string]*jobRecord{}
+	e.diagnostics = nil
 	// Remove memory entries no longer matching configuration. Persisted entries are
 	// keyed by fingerprint and expire naturally; switching configuration cannot use them.
 	for k, t := range e.tickets {
@@ -269,6 +275,18 @@ func kvKey(id int64, model, fp string) string {
 	return fmt.Sprintf("ticket.%d.%s", id, digest(model, fp))
 }
 func proxyFingerprint(raw string) string { return digest("business-proxy-v1", strings.TrimSpace(raw)) }
+func accountEgress(c Config, a AccountConfig, hostProxyURL string) (string, string, error) {
+	if a.EgressMode == egressModePlugin {
+		if a.StickyProxyURL == "" {
+			return "", "", errors.New("account sticky proxy is not configured")
+		}
+		return a.StickyProxyURL, c.UpstreamProxyURL, nil
+	}
+	if err := validateProxy(hostProxyURL); err != nil {
+		return "", "", errors.New("business proxy invalid")
+	}
+	return hostProxyURL, "", nil
+}
 func (e *Engine) accountEnabled(start *pluginv1.ForwardRequestStart) bool {
 	if start == nil || start.Platform != "openai" || start.AccountType != "oauth" {
 		return false
@@ -295,15 +313,23 @@ func (e *Engine) ticketForRequest(_ context.Context, start *pluginv1.ForwardRequ
 	if !contains(a.Models, model) {
 		return nil, nil
 	}
+	targetProxyURL, upstreamProxyURL, err := accountEgress(e.config, a, start.ProxyUrl)
+	if err != nil {
+		return nil, err
+	}
+	expectedFingerprint := proxyFingerprint(targetProxyURL)
 	k := keyFor(start.AccountId, model)
 	t := e.tickets[k]
-	if t != nil && (t.FixedFingerprint != proxyFingerprint(start.ProxyUrl) || t.IdentityFingerprint != stableHeaders(start.AccountId, start.Headers)) {
+	if t != nil && (t.FixedFingerprint != expectedFingerprint || t.IdentityFingerprint != stableHeaders(start.AccountId, start.Headers)) {
 		delete(e.tickets, k)
 		t = nil
 	}
 
-	if !e.closed && e.hostReady && e.directory[start.AccountId] && validTicket(t, e.config, a, model, time.Now()) && t.FixedFingerprint == proxyFingerprint(start.ProxyUrl) && t.IdentityFingerprint == stableHeaders(start.AccountId, start.Headers) && e.revoked[k] != t.Version {
-		return &receipt{State: t.State, Version: t.Version, Key: k, ConfigFingerprint: t.ConfigFingerprint, Generation: e.generation}, nil
+	if !e.closed && e.hostReady && e.directory[start.AccountId] && validTicket(t, e.config, a, model, time.Now()) && t.FixedFingerprint == expectedFingerprint && t.IdentityFingerprint == stableHeaders(start.AccountId, start.Headers) && e.revoked[k] != t.Version {
+		return &receipt{
+			State: t.State, Version: t.Version, Key: k, ConfigFingerprint: t.ConfigFingerprint,
+			TargetProxyURL: targetProxyURL, UpstreamProxyURL: upstreamProxyURL, Generation: e.generation,
+		}, nil
 	}
 	e.notify()
 	return nil, errors.New("verified STATE unavailable; acquisition is running in the background")
@@ -365,7 +391,10 @@ func (e *Engine) notify() {
 	}
 }
 func (e *Engine) snapshotLocked(now time.Time) statusSnapshot {
-	s := statusSnapshot{HostReady: e.hostReady, AccountIDs: []int64{}, AccountCatalog: []statusAccount{}, Tickets: []statusTicket{}, Message: "STATE disabled; requests use the account business proxy"}
+	s := statusSnapshot{HostReady: e.hostReady, AccountIDs: []int64{}, AccountCatalog: []statusAccount{}, Tickets: []statusTicket{}, DiagnosticsEnabled: e.config.DiagnosticLogEnabled, Message: "STATE disabled; requests use the account business proxy"}
+	if e.config.DiagnosticLogEnabled && len(e.diagnostics) > 0 {
+		s.Diagnostics = append([]diagnosticEvent(nil), e.diagnostics...)
+	}
 	for id := range e.directory {
 		s.AccountIDs = append(s.AccountIDs, id)
 	}

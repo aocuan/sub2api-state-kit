@@ -5,13 +5,15 @@ const ui = require('../ui/assets/app.js');
 
 function configured(overrides = {}) {
   return { ...ui.DEFAULT_CONFIG, accounts: [{ account_id: 7, name: '示例账号', email: 'owner@example.com',
-    expires_at: '2026-12-31 23:59', quota: '$12.50 / $20.00', enabled: false, plan: 'pro', models: ['gpt-6-astra'] }], ...overrides };
+    expires_at: '2026-12-31 23:59', quota: '$12.50 / $20.00', enabled: false, egress_mode: 'sub2', sticky_proxy_url: '',
+    plan: 'pro', models: ['gpt-6-astra'] }], ...overrides };
 }
 
 test('empty configuration and newly imported accounts default off', () => {
   assert.deepEqual(ui.normalizeConfig({}), { ...ui.DEFAULT_CONFIG, accounts: [] });
   assert.equal(ui.normalizeConfig({ accounts: [{ account_id: 7 }] }).accounts[0].enabled, false);
   assert.equal(ui.normalizeConfig({ accounts: [{ account_id: 7 }] }).accounts[0].plan, 'pro');
+  assert.equal(ui.normalizeConfig({ accounts: [{ account_id: 7 }] }).accounts[0].egress_mode, 'sub2');
   assert.equal(ui.normalizeConfig({ accounts: [{ account_id: 7, name: ' Example ' }] }).accounts[0].name, 'Example');
   assert.equal(ui.validateConfig(configured()).enabled, false);
 });
@@ -27,6 +29,22 @@ test('requires dynamic proxy only when global and account switches are both on',
   config.dynamic_proxy_url = 'socks5h://proxy.example:1080';
   config.upstream_proxy_id = 17;
   assert.throws(() => ui.validateConfig(config), /缺少可用/);
+});
+
+test('account egress mode can use a fixed provider session without the global dynamic pool', () => {
+  const config = configured({ enabled: true });
+  config.accounts[0].enabled = true;
+  config.accounts[0].egress_mode = 'plugin';
+  config.accounts[0].sticky_proxy_url = 'socks5h://user-session-123:pass@us.proxy.example:10000';
+  assert.equal(ui.validateConfig(config), config);
+  config.dynamic_proxy_url = '';
+  assert.equal(ui.validateConfig(config), config);
+  config.accounts[0].sticky_proxy_url = '';
+  assert.throws(() => ui.validateConfig(config), /必须填写账号粘性代理/);
+  config.accounts[0].sticky_proxy_url = 'socks5h://user-{random}:pass@us.proxy.example:10000';
+  assert.throws(() => ui.validateConfig(config), /固定 session/);
+  config.accounts[0].egress_mode = 'other';
+  assert.throws(() => ui.validateConfig(config), /选择 Sub2/);
 });
 
 test('account labels omit empty fields instead of showing placeholder text', () => {
@@ -57,7 +75,8 @@ test('validates bounds, renewal horizon, duplicate accounts and model allowlist'
 });
 
 test('status tolerates pre-initialization, de-duplicates safe IDs, never labels unknown state as raw text', () => {
-  assert.deepEqual(ui.parseStatus({ healthy: true }), { host_ready: false, account_ids: [], account_catalog: [], tickets: [], message: '' });
+  assert.deepEqual(ui.parseStatus({ healthy: true }), { host_ready: false, account_ids: [], account_catalog: [], tickets: [],
+    diagnostics_enabled: false, diagnostics: [], message: '' });
   const status = ui.parseStatus({ status_json: JSON.stringify({ host_ready: true, account_ids: [8, 2, 8, null, -1, '9', '9007199254740992'],
     account_catalog: [{ account_id: 8, name: ' Eight ', email: 'eight@example.com', expires_at: '2026-10-01', quota: '10/20' }], tickets: [] }) });
   assert.deepEqual(status.account_ids, [2, 8, 9]);
@@ -78,8 +97,27 @@ test('redacts credentials and common ticket fields from error display', () => {
   assert.equal(ui.remainingText(-1), '—');
 });
 
+test('diagnostic events expose state classes and egress evidence without credentials or raw state', () => {
+  const parsed = ui.parseStatus({ status_json: JSON.stringify({
+    host_ready: true, tickets: [], diagnostics_enabled: true,
+    diagnostics: [{ seq: 9, time: '2026-09-21T12:00:00Z', account_id: 19, model: 'gpt-6-astra', stage: 'capture',
+      upstream_proxy: 'socks5://user:secret@first.example:1081', target_proxy: 'socks5://user:secret@second.example:10000',
+      capture_egress: '203.0.113.18', fixed_egress: '198.51.100.24', egress_match: false, state_length: 292,
+      state_class: '292', response_model: 'gpt-6-astra', http_status: 200, outcome: 'accepted', duration_ms: 123,
+      raw_state: 'gAAAAA-secret-state', token: 'secret-token' }]
+  }) });
+  assert.equal(parsed.diagnostics.length, 1);
+  assert.equal(parsed.diagnostics[0].state_class, '292');
+  assert.equal(parsed.diagnostics[0].capture_egress, '203.0.113.18');
+  assert.equal(parsed.diagnostics[0].egress_match, false);
+  assert.equal(JSON.stringify(parsed).includes('secret'), false);
+  assert.equal(JSON.stringify(parsed).includes('gAAAAA-secret-state'), false);
+  assert.equal(ui.diagnosticStageLabel('capture'), '采集票据');
+  assert.equal(ui.diagnosticOutcomeLabel('state_312'), '收到 312');
+});
+
 class Node {
-  constructor(tag) { this.tagName = tag; this.children = []; this.listeners = {}; this.attributes = {}; this._value = ''; this.textContent = ''; this.hidden = false; this.disabled = false; this.checked = false; }
+  constructor(tag) { this.tagName = tag; this.children = []; this.listeners = {}; this.attributes = {}; this._value = ''; this.textContent = ''; this.hidden = false; this.disabled = false; this.checked = false; this.open = false; }
   get value() { return this._value; }
   set value(value) { this._value = String(value); }
   appendChild(child) { this.children.push(child); return child; }
@@ -89,6 +127,8 @@ class Node {
   getAttribute(key) { return this.attributes[key]; }
   async fire(type, event = {}) { if (this.listeners[type]) return this.listeners[type]({ preventDefault() {}, ...event }); }
   click() { return this.fire('click'); }
+  showModal() { this.open = true; }
+  close() { this.open = false; if (this.listeners.close) return this.listeners.close(); }
 }
 
 function uiHarness() {
@@ -130,8 +170,10 @@ test('adding account defaults off, saved-config check does not save or overwrite
   h.get('new-account-id').value = '12'; await h.get('add-account').click();
   const row = h.get('accounts-body').children[1];
   assert.equal(row.children[2].children[0].checked, false);
-  assert.equal(row.children[3].children[0].value, 'pro');
-  assert.equal(row.children[4].children[0].getAttribute('list'), 'model-options');
+  assert.equal(row.children[3].children[0].value, 'sub2');
+  assert.equal(row.children[4].children[0].disabled, true);
+  assert.equal(row.children[5].children[0].value, 'pro');
+  assert.equal(row.children[6].children[0].getAttribute('list'), 'model-options');
   await h.get('test-config').click();
   assert.equal(h.calls.test, 1); assert.equal(h.calls.save.length, 0);
   assert.equal(h.get('accounts-body').children.length, 2);
@@ -186,10 +228,50 @@ test('detected account dropdown shows ID, name and email while model accepts pre
   h.get('new-account-id').value = '7';
   await h.get('add-account').click();
   assert.match(h.get('notice').textContent, /已在列表中/);
-  const model = h.get('accounts-body').children[0].children[4].children[0];
+  const model = h.get('accounts-body').children[0].children[6].children[0];
   model.value = 'gpt-5.6-sol, gpt-custom-model';
   await model.fire('input');
   await h.get('save-config').click();
   assert.deepEqual(h.calls.save[0].accounts[0].models, ['gpt-5.6-sol', 'gpt-custom-model']);
+  h.runtime.stop();
+});
+
+test('account egress mode and sticky proxy are saved per account', async () => {
+  const h = uiHarness(); await settle();
+  const row = h.get('accounts-body').children[0];
+  const egress = row.children[3].children[0];
+  const sticky = row.children[4].children[0];
+  egress.value = 'plugin';
+  await egress.fire('change');
+  assert.equal(sticky.disabled, false);
+  sticky.value = 'socks5h://user-session-123:test-only@us.proxy.example:10000';
+  await sticky.fire('input');
+  await h.get('save-config').click();
+  assert.equal(h.calls.save[0].accounts[0].egress_mode, 'plugin');
+  assert.equal(h.calls.save[0].accounts[0].sticky_proxy_url, sticky.value);
+  h.runtime.stop();
+});
+
+test('diagnostic switch saves and modal renders sanitized evidence', async () => {
+  const h = uiHarness(); await settle();
+  h.get('diagnostic-log-enabled').checked = true;
+  await h.get('save-config').click();
+  assert.equal(h.calls.save[0].diagnostic_log_enabled, true);
+  h.setStatus({ host_ready: true, tickets: [], diagnostics_enabled: true, diagnostics: [{
+    seq: 1, time: '2026-09-21T12:00:00Z', account_id: 19, model: 'gpt-6-astra', stage: 'fixed_validation',
+    upstream_proxy: 'socks5://user:secret@first.example:1081', target_proxy: 'socks5://user:secret@business.example:1081',
+    capture_egress: '203.0.113.18', fixed_egress: '198.51.100.24', egress_match: false, state_length: 312,
+    state_class: '312', response_model: 'gpt-5.6-luna', http_status: 200, outcome: 'state_312', duration_ms: 88
+  }] });
+  await h.get('open-diagnostics').click();
+  function text(node) { return String(node.textContent) + node.children.map(text).join(''); }
+  const rendered = text(h.get('diagnostics-body'));
+  assert.equal(h.get('diagnostics-dialog').open, true);
+  assert.match(rendered, /采集：203\.0\.113\.18/);
+  assert.match(rendered, /固定：198\.51\.100\.24/);
+  assert.match(rendered, /出口不一致/);
+  assert.match(rendered, /312 · 312/);
+  assert.match(rendered, /gpt-5\.6-luna/);
+  assert.equal(rendered.includes('secret'), false);
   h.runtime.stop();
 });

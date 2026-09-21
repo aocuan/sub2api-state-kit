@@ -44,17 +44,17 @@ type clientPool struct {
 
 func newClientPool() *clientPool { return &clientPool{clients: make(map[[32]byte]pooledClient)} }
 
-func (p *clientPool) client(proxyURL string) (*http.Client, error) {
+func (p *clientPool) client(proxyURL, upstreamProxyURL string) (*http.Client, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	key := sha256.Sum256([]byte(proxyURL))
+	key := sha256.Sum256([]byte(proxyURL + "\x00" + upstreamProxyURL))
 	p.clock++
 	if item, ok := p.clients[key]; ok {
 		item.used = p.clock
 		p.clients[key] = item
 		return item.client, nil
 	}
-	client, err := makeHTTPClient(proxyURL, "", false)
+	client, err := makeHTTPClient(proxyURL, upstreamProxyURL, false)
 	if err != nil {
 		return nil, err
 	}
@@ -298,6 +298,8 @@ func (e *Engine) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 		model = request.Model
 		ticket, err = e.ticketForRequest(ctx, start, model)
 		if err != nil {
+			e.recordDiagnostic(diagnosticEvent{AccountID: start.AccountId, Model: model, Stage: "ticket_lookup",
+				TargetProxy: start.ProxyUrl, Outcome: "unavailable", Error: "state_ticket_unavailable"})
 			return sendTicketUnavailable(stream)
 		}
 		if start.HasBody {
@@ -343,13 +345,24 @@ func (e *Engine) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 		// passthrough preserves the caller's compression preferences and raw bytes.
 		req.Header.Set("Accept-Encoding", "identity")
 	}
-	client, err := e.clients.client(start.ProxyUrl)
+	targetProxyURL := start.ProxyUrl
+	upstreamProxyURL := ""
+	if ticket != nil {
+		targetProxyURL = ticket.TargetProxyURL
+		upstreamProxyURL = ticket.UpstreamProxyURL
+	}
+	client, err := e.clients.client(targetProxyURL, upstreamProxyURL)
 	if err != nil {
+		e.recordDiagnostic(diagnosticEvent{AccountID: start.AccountId, Model: model, Stage: "business",
+			UpstreamProxy: upstreamProxyURL, TargetProxy: targetProxyURL, Outcome: "invalid_proxy"})
 		return sendForwardError(stream, "invalid_proxy", "Invalid proxy configuration", false)
 	}
+	requestStarted := time.Now()
 	response, err := client.Do(req)
 	if err != nil {
 		code, message, requestSent := classifyForwardTransportFailure(err)
+		e.recordDiagnostic(diagnosticEvent{AccountID: start.AccountId, Model: model, Stage: "business",
+			UpstreamProxy: upstreamProxyURL, TargetProxy: targetProxyURL, Outcome: code, Error: code, DurationMS: time.Since(requestStarted).Milliseconds()})
 		return sendForwardError(stream, code, message, requestSent)
 	}
 	defer response.Body.Close()
@@ -369,6 +382,14 @@ func (e *Engine) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 	}
 	var observer *completionObserver
 	if ticket != nil && response.StatusCode >= 200 && response.StatusCode < 300 {
+		responseState := response.Header.Get(StateHeader)
+		outcome := "headers_received"
+		if validState(responseState, 312) {
+			outcome = "state_312"
+		}
+		e.recordDiagnostic(diagnosticEvent{AccountID: start.AccountId, Model: model, Stage: "business",
+			UpstreamProxy: upstreamProxyURL, TargetProxy: targetProxyURL, StateLength: len(ticket.State), StateClass: stateDiagnosticClass(ticket.State),
+			HTTPStatus: response.StatusCode, Outcome: outcome, DurationMS: time.Since(requestStarted).Milliseconds()})
 		if validState(response.Header.Get(StateHeader), 312) {
 			e.invalidate(ticket, "state_312")
 		}
@@ -391,6 +412,11 @@ func (e *Engine) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 			// delivered. Observe that completion now rather than waiting for EOF.
 			if observer != nil {
 				if complete, matches := observer.Result(); complete && !matches {
+					actualModel := observer.ActualModel()
+					e.recordDiagnostic(diagnosticEvent{AccountID: start.AccountId, Model: model, Stage: "business_result",
+						UpstreamProxy: upstreamProxyURL, TargetProxy: targetProxyURL, StateClass: stateDiagnosticClass(ticket.State),
+						ResponseModel: actualModel, HTTPStatus: response.StatusCode, Outcome: "model_mismatch",
+						DurationMS: time.Since(requestStarted).Milliseconds()})
 					e.invalidate(ticket, "model_mismatch")
 					observer = nil
 				}
@@ -398,6 +424,16 @@ func (e *Engine) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 		}
 		if readErr != nil {
 			if readErr != io.EOF {
+				responseModel := ""
+				if observer != nil {
+					responseModel = observer.ActualModel()
+				}
+				if ticket != nil {
+					e.recordDiagnostic(diagnosticEvent{AccountID: start.AccountId, Model: model, Stage: "business_result",
+						UpstreamProxy: upstreamProxyURL, TargetProxy: targetProxyURL, StateClass: stateDiagnosticClass(ticket.State),
+						ResponseModel: responseModel, HTTPStatus: response.StatusCode, Outcome: "upstream_read_error",
+						DurationMS: time.Since(requestStarted).Milliseconds()})
+				}
 				return sendForwardError(stream, "upstream_read", "Upstream response was interrupted", true)
 			}
 			break
@@ -406,7 +442,21 @@ func (e *Engine) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 	if observer != nil {
 		observer.Finish()
 		if complete, matches := observer.Result(); complete && !matches {
+			e.recordDiagnostic(diagnosticEvent{AccountID: start.AccountId, Model: model, Stage: "business_result",
+				UpstreamProxy: upstreamProxyURL, TargetProxy: targetProxyURL, StateClass: stateDiagnosticClass(ticket.State),
+				ResponseModel: observer.ActualModel(), HTTPStatus: response.StatusCode, Outcome: "model_mismatch",
+				DurationMS: time.Since(requestStarted).Milliseconds()})
 			e.invalidate(ticket, "model_mismatch")
+		} else if complete {
+			e.recordDiagnostic(diagnosticEvent{AccountID: start.AccountId, Model: model, Stage: "business_result",
+				UpstreamProxy: upstreamProxyURL, TargetProxy: targetProxyURL, StateClass: stateDiagnosticClass(ticket.State),
+				ResponseModel: observer.ActualModel(), HTTPStatus: response.StatusCode, Outcome: "model_match",
+				DurationMS: time.Since(requestStarted).Milliseconds()})
+		} else {
+			e.recordDiagnostic(diagnosticEvent{AccountID: start.AccountId, Model: model, Stage: "business_result",
+				UpstreamProxy: upstreamProxyURL, TargetProxy: targetProxyURL, StateClass: stateDiagnosticClass(ticket.State),
+				ResponseModel: observer.ActualModel(), HTTPStatus: response.StatusCode, Outcome: "incomplete",
+				DurationMS: time.Since(requestStarted).Milliseconds()})
 		}
 	}
 	return stream.Send(&pluginv1.ForwardResponse{Frame: &pluginv1.ForwardResponse_End{End: &pluginv1.ForwardResponseEnd{

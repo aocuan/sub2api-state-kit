@@ -317,6 +317,44 @@ func TestForwardInjectsTicketAndInvalidatesOnModelMismatch(t *testing.T) {
 	}
 }
 
+func TestForwardUsesAccountStickyProxyFromTicket(t *testing.T) {
+	var directHits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		directHits.Add(1)
+		http.Error(w, "direct target must not be used", http.StatusBadGateway)
+	}))
+	defer target.Close()
+	var stickyHits atomic.Int32
+	sticky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stickyHits.Add(1)
+		_, _ = io.WriteString(w, "sticky business")
+	}))
+	defer sticky.Close()
+	stickyURL := "http://sticky-user:sticky-secret@" + strings.TrimPrefix(sticky.URL, "http://")
+
+	e := forwardingEngine(t, true)
+	e.config.Accounts[0].EgressMode = egressModePlugin
+	e.config.Accounts[0].StickyProxyURL = stickyURL
+	addForwardTicket(e, stickyURL)
+	body := []byte(`{"model":"gpt-test"}`)
+	start := mockStart(target.URL, true, int64(len(body)))
+	start.ProxyUrl = "http://127.0.0.1:1"
+	s := fixedStream(start, body)
+	if err := e.Forward(s); err != nil {
+		t.Fatal(err)
+	}
+	if directHits.Load() != 0 || stickyHits.Load() != 1 {
+		t.Fatalf("business egress direct=%d sticky=%d", directHits.Load(), stickyHits.Load())
+	}
+	var got []byte
+	for _, frame := range s.frames() {
+		got = append(got, frame.GetBodyChunk()...)
+	}
+	if string(got) != "sticky business" {
+		t.Fatalf("unexpected body %q", got)
+	}
+}
+
 func TestForwardInvalidatesCompletedMismatchBeforeEOF(t *testing.T) {
 	e := forwardingEngine(t, true)
 	addForwardTicket(e, "")
@@ -514,16 +552,16 @@ func TestForwardInvalidProxyIsNotSentAndDoesNotLeak(t *testing.T) {
 func TestClientPoolBoundedAndProbeClientsAreFresh(t *testing.T) {
 	p := newClientPool()
 	defer p.Close()
-	first, err := p.client("")
+	first, err := p.client("", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, _ := p.client("")
+	second, _ := p.client("", "")
 	if first != second {
 		t.Fatal("client not reused")
 	}
 	for i := 0; i < maxPooledClients+20; i++ {
-		if _, err := p.client(fmt.Sprintf("http://user:pass@proxy-%d.invalid:80", i)); err != nil {
+		if _, err := p.client(fmt.Sprintf("http://user:pass@proxy-%d.invalid:80", i), ""); err != nil {
 			t.Fatal(err)
 		}
 	}

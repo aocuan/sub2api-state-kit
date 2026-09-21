@@ -179,15 +179,32 @@ func (e *Engine) collect(ctx context.Context, host pluginv1.HostServiceClient, c
 			reason = "identity_unavailable"
 			return
 		}
-		rotating, err := rotateProxy(c.DynamicProxyURL)
-		if err != nil {
-			reason = "invalid_dynamic_proxy"
-			return
+		targetProxyURL := ""
+		upstreamProxyURL := ""
+		if a.EgressMode == egressModePlugin {
+			targetProxyURL = a.StickyProxyURL
+			upstreamProxyURL = c.UpstreamProxyURL
+		} else {
+			targetProxyURL, err = rotateProxy(c.DynamicProxyURL)
+			if err != nil {
+				reason = "invalid_dynamic_proxy"
+				return
+			}
+			upstreamProxyURL = c.UpstreamProxyURL
 		}
 		captured := time.Now()
-		candidate, status, err := e.probe(ctx, identity, model, rotating, c.UpstreamProxyURL, "")
+		captureStarted := time.Now()
+		candidate, status, captureModel, err := e.probe(ctx, identity, model, targetProxyURL, upstreamProxyURL, "")
+		captureEgress := e.lookupEgressIP(ctx, targetProxyURL, upstreamProxyURL)
+		captureEvent := diagnosticEvent{AccountID: a.AccountID, Model: model, Stage: "capture", Attempt: attempt,
+			UpstreamProxy: upstreamProxyURL, TargetProxy: targetProxyURL, CaptureEgress: captureEgress,
+			StateLength: len(candidate), StateClass: stateDiagnosticClass(candidate), ResponseModel: captureModel,
+			HTTPStatus: status, DurationMS: time.Since(captureStarted).Milliseconds()}
 		if err != nil {
 			reason = "harvest_failed"
+			captureEvent.Outcome = "probe_failed"
+			captureEvent.Error = err.Error()
+			e.recordDiagnostic(captureEvent)
 			if isStopStatus(status) {
 				reason = stopReason(status)
 				return
@@ -196,10 +213,15 @@ func (e *Engine) collect(ctx context.Context, host pluginv1.HostServiceClient, c
 		}
 		if !validState(candidate, targetLength(a.Plan)) {
 			reason = "unexpected_state_length"
+			captureEvent.Outcome = "unexpected_state"
+			e.recordDiagnostic(captureEvent)
 			continue
 		}
-		// Resolve fresh credentials again, and validate using the host's current
-		// business proxy. Dynamic proxy credentials are never copied into business.
+		captureEvent.Outcome = "accepted"
+		e.recordDiagnostic(captureEvent)
+		// Resolve fresh credentials again and validate through the same account
+		// egress that will serve business traffic. Proxy credentials are never
+		// copied into the ticket.
 		fixed, err := resolveIdentity(ctx, host, a.AccountID)
 		if err != nil {
 			reason = "identity_unavailable"
@@ -209,16 +231,47 @@ func (e *Engine) collect(ctx context.Context, host pluginv1.HostServiceClient, c
 			reason = "identity_changed"
 			continue
 		}
-		returned, status, err := e.probe(ctx, fixed, model, fixed.ProxyUrl, "", candidate)
+		fixedProxyURL, fixedUpstreamProxyURL, err := accountEgress(c, a, fixed.ProxyUrl)
+		if err != nil {
+			reason = "account_egress_invalid"
+			return
+		}
+		validationStarted := time.Now()
+		fixedEgress := e.lookupEgressIP(ctx, fixedProxyURL, fixedUpstreamProxyURL)
+		validationEvent := diagnosticEvent{AccountID: a.AccountID, Model: model, Stage: "fixed_validation", Attempt: attempt,
+			UpstreamProxy: fixedUpstreamProxyURL, TargetProxy: fixedProxyURL, CaptureEgress: captureEgress, FixedEgress: fixedEgress,
+			EgressMatch: egressMatch(captureEgress, fixedEgress)}
+		if a.EgressMode == egressModePlugin && captureEgress != "" && fixedEgress != "" && captureEgress != fixedEgress {
+			reason = "sticky_egress_changed"
+			validationEvent.Outcome = "egress_changed"
+			e.recordDiagnostic(validationEvent)
+			continue
+		}
+		returned, status, validationModel, err := e.probe(ctx, fixed, model, fixedProxyURL, fixedUpstreamProxyURL, candidate)
+		validationEvent.StateLength = len(returned)
+		validationEvent.StateClass = stateDiagnosticClass(returned)
+		validationEvent.ResponseModel = validationModel
+		validationEvent.HTTPStatus = status
+		validationEvent.DurationMS = time.Since(validationStarted).Milliseconds()
 		if err != nil || validState(returned, 312) {
 			reason = "fixed_proxy_validation_failed"
+			validationEvent.Outcome = "validation_failed"
+			if validState(returned, 312) {
+				validationEvent.Outcome = "state_312"
+			}
+			if err != nil {
+				validationEvent.Error = err.Error()
+			}
+			e.recordDiagnostic(validationEvent)
 			if isStopStatus(status) {
 				reason = stopReason(status)
 				return
 			}
 			continue
 		}
-		t := &ticket{AccountID: a.AccountID, Model: model, Plan: a.Plan, State: candidate, Version: randomID(), ConfigFingerprint: fp, FixedFingerprint: proxyFingerprint(fixed.ProxyUrl), IdentityFingerprint: stableIdentity(fixed), CapturedAt: captured, ExpiresAt: captured.Add(time.Duration(c.TTLMinutes) * time.Minute)}
+		validationEvent.Outcome = "accepted"
+		e.recordDiagnostic(validationEvent)
+		t := &ticket{AccountID: a.AccountID, Model: model, Plan: a.Plan, State: candidate, Version: randomID(), ConfigFingerprint: fp, FixedFingerprint: proxyFingerprint(fixedProxyURL), IdentityFingerprint: stableIdentity(fixed), CapturedAt: captured, ExpiresAt: captured.Add(time.Duration(c.TTLMinutes) * time.Minute)}
 		if e.commit(ctx, host, c, a, model, k, gen, t, true) {
 			success = true
 			return
@@ -245,9 +298,6 @@ func resolveIdentity(ctx context.Context, host pluginv1.HostServiceClient, id in
 	r, err := host.ResolveOutboundIdentity(c, &pluginv1.ResolveOutboundIdentityRequest{AccountId: id})
 	if err != nil || r == nil || !r.Found || r.AccountId != id || r.Platform != "openai" || r.AccountType != "oauth" || r.Token == "" {
 		return nil, errors.New("account identity unavailable")
-	}
-	if err = validateProxy(r.ProxyUrl); err != nil {
-		return nil, errors.New("business proxy invalid")
 	}
 	return r, nil
 }
@@ -281,14 +331,35 @@ func (e *Engine) restore(ctx context.Context, host pluginv1.HostServiceClient, c
 	if err != nil || r == nil || !r.Found || len(r.Value) > 16*1024 {
 		return false, 0
 	}
-	var t ticket
-	if json.Unmarshal(r.Value, &t) != nil || !validTicket(&t, c, a, model, time.Now()) || t.Version == revoked || t.FixedFingerprint != proxyFingerprint(identity.ProxyUrl) || t.IdentityFingerprint != stableIdentity(identity) {
+	targetProxyURL, upstreamProxyURL, err := accountEgress(c, a, identity.ProxyUrl)
+	if err != nil {
 		return false, 0
 	}
-	returned, status, err := e.probe(ctx, identity, model, identity.ProxyUrl, "", t.State)
+	expectedFingerprint := proxyFingerprint(targetProxyURL)
+	var t ticket
+	if json.Unmarshal(r.Value, &t) != nil || !validTicket(&t, c, a, model, time.Now()) || t.Version == revoked || t.FixedFingerprint != expectedFingerprint || t.IdentityFingerprint != stableIdentity(identity) {
+		return false, 0
+	}
+	restoreStarted := time.Now()
+	fixedEgress := e.lookupEgressIP(ctx, targetProxyURL, upstreamProxyURL)
+	returned, status, responseModel, err := e.probe(ctx, identity, model, targetProxyURL, upstreamProxyURL, t.State)
+	event := diagnosticEvent{AccountID: a.AccountID, Model: model, Stage: "restore",
+		UpstreamProxy: upstreamProxyURL, TargetProxy: targetProxyURL,
+		FixedEgress: fixedEgress, StateLength: len(returned), StateClass: stateDiagnosticClass(returned),
+		ResponseModel: responseModel, HTTPStatus: status, DurationMS: time.Since(restoreStarted).Milliseconds()}
 	if err != nil || validState(returned, 312) {
+		event.Outcome = "validation_failed"
+		if validState(returned, 312) {
+			event.Outcome = "state_312"
+		}
+		if err != nil {
+			event.Error = err.Error()
+		}
+		e.recordDiagnostic(event)
 		return false, status
 	}
+	event.Outcome = "accepted"
+	e.recordDiagnostic(event)
 	return e.commit(ctx, host, c, a, model, k, gen, &t, false), status
 }
 func (e *Engine) commit(ctx context.Context, host pluginv1.HostServiceClient, c Config, a AccountConfig, model, k string, gen uint64, t *ticket, persist bool) bool {
@@ -321,14 +392,14 @@ func (e *Engine) commit(ctx context.Context, host pluginv1.HostServiceClient, c 
 	return true
 }
 
-func (e *Engine) probe(ctx context.Context, identity *pluginv1.ResolveOutboundIdentityResponse, model, proxyURL, upstreamProxyURL, state string) (string, int, error) {
+func (e *Engine) probe(ctx context.Context, identity *pluginv1.ResolveOutboundIdentityResponse, model, proxyURL, upstreamProxyURL, state string) (string, int, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	payload := map[string]any{"model": model, "store": false, "stream": true, "instructions": "Reply with exactly: pong", "input": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "ping"}}}}}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.probeURL, bytes.NewReader(body))
 	if err != nil {
-		return "", 0, errors.New("probe construction failed")
+		return "", 0, "", errors.New("probe construction failed")
 	}
 	for name, values := range identity.Headers {
 		if values == nil {
@@ -354,17 +425,17 @@ func (e *Engine) probe(ctx context.Context, identity *pluginv1.ResolveOutboundId
 	req.Close = true
 	client, err := freshProbeClient(proxyURL, upstreamProxyURL)
 	if err != nil {
-		return "", 0, errors.New("probe transport unavailable")
+		return "", 0, "", errors.New("probe transport unavailable")
 	}
 	defer client.CloseIdleConnections()
 	response, err := client.Do(req)
 	if err != nil {
-		return "", 0, errors.New("probe transport failed")
+		return "", 0, "", errors.New("probe transport failed")
 	}
 	defer response.Body.Close()
 	status := response.StatusCode
 	if status != http.StatusOK {
-		return "", status, errors.New("probe request rejected")
+		return "", status, "", errors.New("probe request rejected")
 	}
 	observer := newCompletionObserver(model)
 	buf := make([]byte, 16*1024)
@@ -374,7 +445,7 @@ func (e *Engine) probe(ctx context.Context, identity *pluginv1.ResolveOutboundId
 		if n > 0 {
 			total += n
 			if total > 4*1024*1024 {
-				return "", status, errors.New("probe response too large")
+				return "", status, observer.ActualModel(), errors.New("probe response too large")
 			}
 			observer.Write(buf[:n])
 		}
@@ -382,15 +453,15 @@ func (e *Engine) probe(ctx context.Context, identity *pluginv1.ResolveOutboundId
 			break
 		}
 		if readErr != nil {
-			return "", status, errors.New("probe response interrupted")
+			return "", status, observer.ActualModel(), errors.New("probe response interrupted")
 		}
 	}
 	observer.Finish()
 	complete, matches := observer.Result()
 	if !complete || !matches {
-		return "", status, errors.New("probe did not complete with requested model")
+		return "", status, observer.ActualModel(), errors.New("probe did not complete with requested model")
 	}
-	return strings.TrimSpace(response.Header.Get(StateHeader)), status, nil
+	return strings.TrimSpace(response.Header.Get(StateHeader)), status, observer.ActualModel(), nil
 }
 
 var sidPattern = regexp.MustCompile(`(?i)(-sid-)[^-]+`)

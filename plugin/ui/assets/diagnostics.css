@@ -1,0 +1,70 @@
+.diagnostic-switch {
+  margin-top: 18px;
+}
+
+.diagnostic-dialog {
+  width: min(1180px, calc(100vw - 32px));
+  max-width: 1180px;
+  max-height: calc(100vh - 32px);
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  overflow: auto;
+}
+
+.diagnostic-dialog::backdrop {
+  background: #0009;
+}
+
+.diagnostics-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.diagnostics-table {
+  max-height: calc(100vh - 190px);
+  margin-top: 16px;
+}
+
+.diagnostics-table table {
+  min-width: 1280px;
+}
+
+.diagnostic-mono {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px;
+  white-space: pre-line;
+  max-width: 260px;
+  overflow-wrap: anywhere;
+}
+
+.diagnostic-sub {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+@media (max-width: 680px) {
+  .sr-only {
+    left: 0;
+  }
+
+  .diagnostics-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .diagnostic-dialog {
+    width: calc(100vw - 16px);
+    max-height: calc(100vh - 16px);
+    padding: 14px;
+  }
+
+  .diagnostics-table {
+    max-height: calc(100vh - 180px);
+  }
+}

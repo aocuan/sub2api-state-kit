@@ -16,6 +16,7 @@ type completionObserver struct {
 	line, event, body                         []byte
 	lineOverflow, eventOverflow, bodyOverflow bool
 	complete, matches                         bool
+	actualModel                               string
 }
 
 func newCompletionObserver(expected string) *completionObserver {
@@ -123,7 +124,14 @@ func (o *completionObserver) inspect(data []byte) {
 		return
 	}
 	o.complete = true
+	if o.actualModel == "" {
+		o.actualModel = model
+	}
 	o.matches = o.matches && model == o.expected
+}
+
+func (o *completionObserver) ActualModel() string {
+	return o.actualModel
 }
 
 func noResponseError(raw json.RawMessage) bool {

@@ -14,9 +14,14 @@ import (
 )
 
 const PluginID = "io.github.wangyunjeff.sub2api-state-kit"
-const Version = "0.3.4"
+const Version = "0.3.6"
 const StateHeader = "x-codex-turn-state"
 const namespace = "state-kit-v1"
+
+const (
+	egressModeSub2   = "sub2"
+	egressModePlugin = "plugin"
+)
 
 // Config contains no OAuth credentials. The host owns credential refresh.
 type Config struct {
@@ -24,6 +29,7 @@ type Config struct {
 	UpstreamProxyID        int64           `json:"upstream_proxy_id"`
 	UpstreamProxyURL       string          `json:"upstream_proxy_url"`
 	DynamicProxyURL        string          `json:"dynamic_proxy_url"`
+	DiagnosticLogEnabled   bool            `json:"diagnostic_log_enabled"`
 	TTLMinutes             int             `json:"ttl_minutes"`
 	RefreshBeforeMinutes   int             `json:"refresh_before_minutes"`
 	MaxAttempts            int             `json:"max_attempts"`
@@ -32,14 +38,16 @@ type Config struct {
 	Accounts               []AccountConfig `json:"accounts"`
 }
 type AccountConfig struct {
-	AccountID int64    `json:"account_id"`
-	Name      string   `json:"name,omitempty"`
-	Email     string   `json:"email,omitempty"`
-	ExpiresAt string   `json:"expires_at,omitempty"`
-	Quota     string   `json:"quota,omitempty"`
-	Enabled   bool     `json:"enabled"`
-	Plan      string   `json:"plan"`
-	Models    []string `json:"models"`
+	AccountID      int64    `json:"account_id"`
+	Name           string   `json:"name,omitempty"`
+	Email          string   `json:"email,omitempty"`
+	ExpiresAt      string   `json:"expires_at,omitempty"`
+	Quota          string   `json:"quota,omitempty"`
+	Enabled        bool     `json:"enabled"`
+	EgressMode     string   `json:"egress_mode"`
+	StickyProxyURL string   `json:"sticky_proxy_url,omitempty"`
+	Plan           string   `json:"plan"`
+	Models         []string `json:"models"`
 }
 
 func DefaultConfig() Config {
@@ -103,6 +111,7 @@ func ParseConfig(raw []byte) (Config, error) {
 	}
 	seen := map[int64]bool{}
 	anyEnabled := false
+	needsDynamicProxy := false
 	total := 0
 	for i := range c.Accounts {
 		a := &c.Accounts[i]
@@ -112,6 +121,25 @@ func ParseConfig(raw []byte) (Config, error) {
 		seen[a.AccountID] = true
 		if err := normalizeAccountDisplayFields(a); err != nil {
 			return c, err
+		}
+		a.EgressMode = strings.TrimSpace(a.EgressMode)
+		if a.EgressMode == "" {
+			a.EgressMode = egressModeSub2
+		}
+		if a.EgressMode != egressModeSub2 && a.EgressMode != egressModePlugin {
+			return c, errors.New("egress_mode must be sub2 or plugin")
+		}
+		a.StickyProxyURL = strings.TrimSpace(a.StickyProxyURL)
+		if err := validateProxy(a.StickyProxyURL); err != nil {
+			return c, err
+		}
+		if a.EgressMode == egressModePlugin {
+			if a.StickyProxyURL == "" {
+				return c, errors.New("sticky_proxy_url is required for plugin egress mode")
+			}
+			if strings.Contains(a.StickyProxyURL, "{sid}") || strings.Contains(a.StickyProxyURL, "{random}") {
+				return c, errors.New("sticky_proxy_url must use a fixed provider session, not {sid} or {random}")
+			}
 		}
 		if a.Plan == "" {
 			a.Plan = "pro"
@@ -134,12 +162,13 @@ func ParseConfig(raw []byte) (Config, error) {
 		}
 		total += len(a.Models)
 		anyEnabled = anyEnabled || a.Enabled
+		needsDynamicProxy = needsDynamicProxy || a.Enabled && a.EgressMode == egressModeSub2
 	}
 	if total > 1024 {
 		return c, errors.New("at most 1024 account/model pairs are supported")
 	}
-	if c.Enabled && anyEnabled && c.DynamicProxyURL == "" {
-		return c, errors.New("dynamic_proxy_url is required for enabled accounts")
+	if c.Enabled && anyEnabled && needsDynamicProxy && c.DynamicProxyURL == "" {
+		return c, errors.New("dynamic_proxy_url is required for enabled accounts using sub2 egress")
 	}
 	return c, nil
 }
@@ -215,10 +244,12 @@ func digest(parts ...string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 func configFingerprint(c Config, a AccountConfig, model string) string {
-	return digest("v2", c.UpstreamProxyURL, c.DynamicProxyURL, a.Plan, model, jsonText(struct {
-		ID  int64
-		TTL int
-	}{a.AccountID, c.TTLMinutes}))
+	return digest("v3", c.UpstreamProxyURL, c.DynamicProxyURL, a.Plan, model, jsonText(struct {
+		ID             int64
+		TTL            int
+		EgressMode     string
+		StickyProxyURL string
+	}{a.AccountID, c.TTLMinutes, a.EgressMode, a.StickyProxyURL}))
 }
 func jsonText(v any) string { b, _ := json.Marshal(v); return string(b) }
 func targetLength(plan string) int {

@@ -129,7 +129,7 @@ func TestConfigStrictIsolation(t *testing.T) {
 	if err != nil || c.Enabled || c.TTLMinutes != 60 || len(c.Accounts) != 0 {
 		t.Fatalf("defaults: %+v %v", c, err)
 	}
-	bad := []string{`{"unknown":true}`, `null`, `{"ttl_minutes":61}`, `{"ttl_minutes":5,"refresh_before_minutes":5}`, `{"max_attempts":33}`, `{"enabled":true,"accounts":[{"account_id":1,"enabled":true}]}`, `{"accounts":[{"account_id":1},{"account_id":1}]}`, `{"accounts":[{"account_id":1,"models":["gpt-6-astra","gpt-6-astra"]}]}`, `{"dynamic_proxy_url":"file:///tmp/a"}`, `{"dynamic_proxy_url":"http://host/secret?token=x"}`, `{"accounts":[{"account_id":1,"plan":"wrong"}]}`, `{"accounts":[{"account_id":1,"email":"not-an-email"}]}`, `{"accounts":[{"account_id":1,"name":"bad\nname"}]}`}
+	bad := []string{`{"unknown":true}`, `null`, `{"ttl_minutes":61}`, `{"ttl_minutes":5,"refresh_before_minutes":5}`, `{"max_attempts":33}`, `{"enabled":true,"accounts":[{"account_id":1,"enabled":true}]}`, `{"accounts":[{"account_id":1},{"account_id":1}]}`, `{"accounts":[{"account_id":1,"models":["gpt-6-astra","gpt-6-astra"]}]}`, `{"dynamic_proxy_url":"file:///tmp/a"}`, `{"dynamic_proxy_url":"http://host/secret?token=x"}`, `{"accounts":[{"account_id":1,"plan":"wrong"}]}`, `{"accounts":[{"account_id":1,"email":"not-an-email"}]}`, `{"accounts":[{"account_id":1,"name":"bad\nname"}]}`, `{"accounts":[{"account_id":1,"egress_mode":"plugin"}]}`, `{"accounts":[{"account_id":1,"egress_mode":"plugin","sticky_proxy_url":"socks5h://user-{random}:pass@proxy.example:1080"}]}`, `{"accounts":[{"account_id":1,"egress_mode":"other","sticky_proxy_url":"socks5h://proxy.example:1080"}]}`}
 	for _, raw := range bad {
 		if _, err := ParseConfig([]byte(raw)); err == nil {
 			t.Errorf("accepted invalid config %s", raw)
@@ -148,6 +148,13 @@ func TestConfigStrictIsolation(t *testing.T) {
 	got := meta.Accounts[0]
 	if got.Name != "Example" || got.Email != "owner@example.com" || got.ExpiresAt != "2026-12-31 23:59" || got.Quota != "$12.50 / $20.00" {
 		t.Fatalf("display metadata not normalized: %+v", got)
+	}
+	plugin, err := ParseConfig([]byte(`{"enabled":true,"upstream_proxy_url":"socks5://first.example:1081","accounts":[{"account_id":9,"enabled":true,"egress_mode":"plugin","sticky_proxy_url":"socks5h://user-session-123:pass@us.example:10000"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plugin.Accounts[0].EgressMode != egressModePlugin || plugin.DynamicProxyURL != "" {
+		t.Fatalf("plugin egress configuration not normalized: %+v", plugin)
 	}
 }
 func TestCollectFixedProxyValidationAndPersistence(t *testing.T) {
@@ -222,6 +229,56 @@ func TestCollectFixedProxyValidationAndPersistence(t *testing.T) {
 		t.Fatalf("restart did not revalidate KV ticket: dynamic=%d fixed=%d", dynamic.Load(), fixed.Load())
 	}
 }
+
+func TestPluginEgressUsesAccountStickyProxyForCaptureAndValidation(t *testing.T) {
+	h := testHost(42)
+	var dynamicHits atomic.Int32
+	dynamic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dynamicHits.Add(1)
+		http.Error(w, "dynamic pool must not be used", http.StatusBadGateway)
+	}))
+	defer dynamic.Close()
+	var stickyHits atomic.Int32
+	sticky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stickyHits.Add(1)
+		if r.Header.Get("Authorization") != "Bearer test-token-42" {
+			t.Error("sticky proxy lost account authorization")
+		}
+		if stickyHits.Load() == 1 {
+			if r.Header.Get(StateHeader) != "" {
+				t.Error("capture unexpectedly carried STATE")
+			}
+			w.Header().Set(StateHeader, testState(292))
+		} else if r.Header.Get(StateHeader) != testState(292) {
+			t.Error("fixed validation lost STATE")
+		}
+		completed(w, "gpt-6-astra")
+	}))
+	defer sticky.Close()
+	stickyURL := "http://sticky-user:sticky-secret@" + strings.TrimPrefix(sticky.URL, "http://")
+
+	e := testEngine(t, h, "http://chatgpt.example/backend-api/codex/responses")
+	c := testConfig(dynamic.URL, 42)
+	c.Accounts[0].EgressMode = egressModePlugin
+	c.Accounts[0].StickyProxyURL = stickyURL
+	apply(t, e, c)
+	waitFor(t, e, "ready")
+	if dynamicHits.Load() != 0 || stickyHits.Load() != 2 {
+		t.Fatalf("egress routing dynamic=%d sticky=%d", dynamicHits.Load(), stickyHits.Load())
+	}
+	r, err := e.ticketForRequest(context.Background(), testStart(42), "gpt-6-astra")
+	if err != nil || r == nil || r.TargetProxyURL != stickyURL || r.UpstreamProxyURL != "" {
+		t.Fatalf("ticket did not retain account sticky proxy: %+v %v", r, err)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, value := range h.values {
+		if strings.Contains(string(value), "sticky-secret") || strings.Contains(string(value), stickyURL) {
+			t.Fatal("proxy credentials were persisted with ticket")
+		}
+	}
+}
+
 func TestPlanLengthMismatchAndRoutingFailure(t *testing.T) {
 	for _, tc := range []struct {
 		name, plan, actual string
