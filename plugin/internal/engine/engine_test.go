@@ -74,6 +74,12 @@ func (h *fakeHost) ResolveOutboundIdentity(_ context.Context, r *pluginv1.Resolv
 	return proto.Clone(original).(*pluginv1.ResolveOutboundIdentityResponse), nil
 }
 func testState(n int) string { return "gAAAAA" + strings.Repeat("A", n-6) }
+func acceptMint(w http.ResponseWriter, n int, model string) {
+	w.Header().Set(StateHeader, testState(n))
+	w.Header().Add("Set-Cookie", "__cflb=cflb-test; Path=/")
+	w.Header().Add("Set-Cookie", "__oailb=oailb-test; Path=/")
+	completed(w, model)
+}
 func completed(w http.ResponseWriter, model string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	fmt.Fprintf(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"model\":%q}}\n\n", model)
@@ -161,11 +167,17 @@ func TestCollectFixedProxyValidationAndPersistence(t *testing.T) {
 	var dynamic, fixed atomic.Int32
 	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		dynamic.Add(1)
-		if r.Header.Get("Authorization") != "Bearer test-token-42" || r.Header.Get(StateHeader) != "" {
-			t.Error("dynamic identity or STATE incorrect")
+		if r.Header.Get("Authorization") != "Bearer test-token-42" || r.Header.Get("X-OpenAI-Internal-Codex-Responses-Lite") != "true" {
+			t.Error("dynamic identity or lite header incorrect")
 		}
-		w.Header().Set(StateHeader, testState(292))
-		completed(w, "gpt-6-astra")
+		if dynamic.Load() == 1 {
+			if r.Header.Get(StateHeader) != "" || r.Header.Get("Cookie") != "" {
+				t.Error("mint carried state or cookie")
+			}
+		} else if r.Header.Get(StateHeader) != testState(292) || !strings.Contains(r.Header.Get("Cookie"), "__oailb=oailb-test") {
+			t.Error("confirm did not reuse the minted pair")
+		}
+		acceptMint(w, 292, "gpt-6-astra")
 	}))
 	defer pool.Close()
 	business := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -180,7 +192,7 @@ func TestCollectFixedProxyValidationAndPersistence(t *testing.T) {
 	c := testConfig(pool.URL, 42)
 	apply(t, e, c)
 	waitFor(t, e, "ready")
-	if dynamic.Load() != 1 || fixed.Load() != 1 {
+	if dynamic.Load() != 2 || fixed.Load() != 1 {
 		t.Fatalf("requests dynamic=%d fixed=%d", dynamic.Load(), fixed.Load())
 	}
 	r, err := e.ticketForRequest(context.Background(), testStart(42), "gpt-6-astra")
@@ -204,7 +216,7 @@ func TestCollectFixedProxyValidationAndPersistence(t *testing.T) {
 		t.Fatal("ticket reused on changed account identity")
 	}
 	health, _ := e.Health(context.Background(), &pluginv1.HealthRequest{})
-	if strings.Contains(health.StatusJson, testState(292)) || strings.Contains(health.StatusJson, "test-token") {
+	if strings.Contains(health.StatusJson, testState(292)) || strings.Contains(health.StatusJson, "test-token") || strings.Contains(health.StatusJson, "cflb-test") {
 		t.Fatal("secret in health")
 	}
 	h.mu.Lock()
@@ -215,7 +227,7 @@ func TestCollectFixedProxyValidationAndPersistence(t *testing.T) {
 	}
 	h.mu.Unlock()
 	apply(t, e, c)
-	if dynamic.Load() != 1 {
+	if dynamic.Load() != 2 {
 		t.Fatal("identical config started duplicate harvest")
 	}
 	// Recreate engine using the same host KV. Restoration revalidates on fixed IP
@@ -224,7 +236,7 @@ func TestCollectFixedProxyValidationAndPersistence(t *testing.T) {
 	e2 := testEngine(t, h, business.URL)
 	apply(t, e2, c)
 	waitFor(t, e2, "ready")
-	if dynamic.Load() != 1 || fixed.Load() != 2 {
+	if dynamic.Load() != 2 || fixed.Load() != 2 {
 		t.Fatalf("restart did not revalidate KV ticket: dynamic=%d fixed=%d", dynamic.Load(), fixed.Load())
 	}
 }
@@ -244,12 +256,17 @@ func TestPluginEgressUsesAccountStickyProxyForCaptureAndValidation(t *testing.T)
 			t.Error("sticky proxy lost account authorization")
 		}
 		if stickyHits.Load() == 1 {
-			if r.Header.Get(StateHeader) != "" {
-				t.Error("capture unexpectedly carried STATE")
+			if r.Header.Get(StateHeader) != "" || r.Header.Get("Cookie") != "" {
+				t.Error("capture unexpectedly carried STATE or cookie")
 			}
-			w.Header().Set(StateHeader, testState(292))
-		} else if r.Header.Get(StateHeader) != testState(292) {
-			t.Error("fixed validation lost STATE")
+			if r.Header.Get("X-OpenAI-Internal-Codex-Responses-Lite") != "true" {
+				t.Error("mint missing lite header")
+			}
+			acceptMint(w, 292, "gpt-6-astra")
+			return
+		}
+		if r.Header.Get(StateHeader) != testState(292) || !strings.Contains(r.Header.Get("Cookie"), "__cflb=cflb-test") {
+			t.Error("reuse lost STATE or cookie")
 		}
 		completed(w, "gpt-6-astra")
 	}))
@@ -262,7 +279,7 @@ func TestPluginEgressUsesAccountStickyProxyForCaptureAndValidation(t *testing.T)
 	c.Accounts[0].StickyProxyURL = stickyURL
 	apply(t, e, c)
 	waitFor(t, e, "ready")
-	if dynamicHits.Load() != 0 || stickyHits.Load() != 2 {
+	if dynamicHits.Load() != 0 || stickyHits.Load() != 3 {
 		t.Fatalf("egress routing dynamic=%d sticky=%d", dynamicHits.Load(), stickyHits.Load())
 	}
 	r, err := e.ticketForRequest(context.Background(), testStart(42), "gpt-6-astra")
@@ -284,13 +301,12 @@ func TestPlanLengthMismatchAndRoutingFailure(t *testing.T) {
 		length             int
 		want               string
 	}{
-		{"team332", "team", "gpt-6-astra", 332, "ready"}, {"teamReject292", "team", "gpt-6-astra", 292, "cooldown"}, {"proReject332", "pro", "gpt-6-astra", 332, "cooldown"}, {"lengthAloneInsufficient", "pro", "gpt-5.6-luna", 292, "cooldown"},
+		{"team332", "team", "gpt-6-astra", 332, "ready"}, {"team292", "team", "gpt-6-astra", 292, "ready"}, {"pro332", "pro", "gpt-6-astra", 332, "ready"}, {"lengthAloneInsufficient", "pro", "gpt-5.6-luna", 292, "cooldown"}, {"degraded312", "pro", "gpt-6-astra", 312, "cooldown"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := testHost(42)
 			pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set(StateHeader, testState(tc.length))
-				completed(w, tc.actual)
+				acceptMint(w, tc.length, tc.actual)
 			}))
 			defer pool.Close()
 			business := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { completed(w, "gpt-6-astra") }))
@@ -329,8 +345,7 @@ func TestFailedRenewalRetainsTicketAndLateWatchdogCannotRevokeNew(t *testing.T) 
 			w.WriteHeader(429)
 			return
 		}
-		w.Header().Set(StateHeader, testState(292))
-		completed(w, "gpt-6-astra")
+		acceptMint(w, 292, "gpt-6-astra")
 	}))
 	defer pool.Close()
 	business := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { completed(w, "gpt-6-astra") }))
@@ -445,8 +460,7 @@ func TestFixedProxyChangeTriggersCollectionBeforeExpiry(t *testing.T) {
 	var dynamic atomic.Int32
 	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		dynamic.Add(1)
-		w.Header().Set(StateHeader, testState(292))
-		completed(w, "gpt-6-astra")
+		acceptMint(w, 292, "gpt-6-astra")
 	}))
 	defer pool.Close()
 	business := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { completed(w, "gpt-6-astra") }))
@@ -471,7 +485,7 @@ func TestFixedProxyChangeTriggersCollectionBeforeExpiry(t *testing.T) {
 		t.Fatal("changed fixed proxy used old ticket")
 	}
 	waitFor(t, e, "ready")
-	if dynamic.Load() != 2 {
+	if dynamic.Load() != 4 {
 		t.Fatalf("did not immediately recollect for changed binding: %d", dynamic.Load())
 	}
 	if _, err := e.ticketForRequest(context.Background(), start, "gpt-6-astra"); err != nil {
@@ -484,8 +498,7 @@ func TestFixedRevalidationRejectsRoutingAnd312(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			h := testHost(42)
 			pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set(StateHeader, testState(292))
-				completed(w, "gpt-6-astra")
+				acceptMint(w, 292, "gpt-6-astra")
 			}))
 			defer pool.Close()
 			business := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -529,8 +542,7 @@ func (h *slowKVHost) KVSet(ctx context.Context, r *pluginv1.KVSetRequest, opts .
 func TestSlowPersistenceDoesNotBlockHealthOrConfig(t *testing.T) {
 	h := &slowKVHost{fakeHost: testHost(42), entered: make(chan struct{})}
 	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(StateHeader, testState(292))
-		completed(w, "gpt-6-astra")
+		acceptMint(w, 292, "gpt-6-astra")
 	}))
 	defer pool.Close()
 	business := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { completed(w, "gpt-6-astra") }))

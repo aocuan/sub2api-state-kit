@@ -160,7 +160,7 @@ test('passive status refresh preserves unsaved form and never invokes test or sa
   await h.runtime.refreshStatus();
   assert.equal(h.get('dynamic-proxy-url').value, 'socks5h://unsaved:password@proxy.example:1080');
   assert.equal(h.get('save-state').textContent, '有未保存修改');
-  assert.equal(h.calls.load, 1); assert.equal(h.calls.save.length, 0); assert.equal(h.calls.test, 0); assert.equal(h.calls.accounts, 1);
+  assert.equal(h.calls.load, 1); assert.equal(h.calls.save.length, 0); assert.equal(h.calls.test, 0); assert.equal(h.calls.accounts, 0); assert.equal(h.calls.proxies, 0);
   assert.equal(h.get('new-account-id').children.length, 4);
   h.runtime.stop(); assert.equal(h.timers.size, 0);
 });
@@ -181,15 +181,16 @@ test('adding account defaults off, saved-config check does not save or overwrite
   h.runtime.stop();
 });
 
-test('selecting an IP management proxy saves its resolved first-layer URL', async () => {
+test('dynamic proxy address is saved without a host proxy list', async () => {
   const h = uiHarness(); await settle();
-  assert.equal(h.get('upstream-proxy-id').children.length, 2);
-  h.get('upstream-proxy-id').value = '17';
-  await h.get('config-form').fire('change');
+  assert.equal(h.calls.proxies, 0);
+  assert.equal(h.get('upstream-proxy-id').children.length, 1);
+  h.get('dynamic-proxy-url').value = 'socks5h://user:pass@proxy.example:1080';
   await h.get('save-config').click();
   assert.equal(h.calls.save.length, 1);
-  assert.equal(h.calls.save[0].upstream_proxy_id, 17);
-  assert.equal(h.calls.save[0].upstream_proxy_url, 'socks5://proxy-user:test-only@203.0.113.17:1081');
+  assert.equal(h.calls.save[0].upstream_proxy_id, 0);
+  assert.equal(h.calls.save[0].upstream_proxy_url, '');
+  assert.equal(h.calls.save[0].dynamic_proxy_url, 'socks5h://user:pass@proxy.example:1080');
   h.runtime.stop();
 });
 
@@ -200,7 +201,7 @@ test('explicit save button works without native form submission in sandbox', asy
   assert.equal(h.calls.save.length, 1);
   assert.equal(h.calls.save[0].enabled, false);
   assert.equal(h.calls.save[0].accounts[1].enabled, false);
-  assert.equal(h.calls.save[0].accounts[1].name, '账号十二');
+  assert.equal(h.calls.save[0].accounts[1].name, '');
   assert.equal(h.get('save-state').textContent, '已保存');
   assert.match(h.get('notice').textContent, /STATE Kit 已关闭/);
   h.runtime.stop();
@@ -224,7 +225,7 @@ test('detected account dropdown shows ID, name and email while model accepts pre
   const h = uiHarness(); await settle();
   const choices = h.get('new-account-id').children;
   assert.match(String(choices[1].textContent), /#7 · 示例账号 · owner@example\.com/);
-  assert.match(String(choices[2].textContent), /#12 · 账号十二 · account12@example\.com/);
+  assert.equal(String(choices[2].textContent), '#12');
   h.get('new-account-id').value = '7';
   await h.get('add-account').click();
   assert.match(h.get('notice').textContent, /已在列表中/);

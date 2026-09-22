@@ -335,11 +335,14 @@ func (e *Engine) Forward(stream pluginv1.TransportPlugin_ForwardServer) error {
 		// Remove differently cased map keys as well; Set alone canonicalizes only
 		// the new key and could leave a caller-supplied duplicate header intact.
 		for key := range req.Header {
-			if strings.EqualFold(key, StateHeader) || strings.EqualFold(key, "Accept-Encoding") {
+			if strings.EqualFold(key, StateHeader) || strings.EqualFold(key, "Accept-Encoding") || strings.EqualFold(key, "Cookie") {
 				delete(req.Header, key)
 			}
 		}
 		req.Header.Set(StateHeader, ticket.State)
+		if ticket.Cookie != "" {
+			req.Header.Set("Cookie", ticket.Cookie)
+		}
 		// Completion inspection observes the bytes actually forwarded to the host.
 		// Negotiate an uncompressed response only when we inject a ticket; normal
 		// passthrough preserves the caller's compression preferences and raw bytes.

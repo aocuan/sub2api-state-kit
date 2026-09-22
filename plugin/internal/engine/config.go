@@ -247,7 +247,7 @@ func digest(parts ...string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 func configFingerprint(c Config, a AccountConfig, model string) string {
-	return digest("v3", c.UpstreamProxyURL, c.DynamicProxyURL, a.Plan, model, jsonText(struct {
+	return digest("v4", c.UpstreamProxyURL, c.DynamicProxyURL, a.Plan, model, jsonText(struct {
 		ID             int64
 		TTL            int
 		EgressMode     string

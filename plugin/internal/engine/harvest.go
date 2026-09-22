@@ -1,16 +1,13 @@
 package engine
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math/big"
-	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -194,7 +191,7 @@ func (e *Engine) collect(ctx context.Context, host pluginv1.HostServiceClient, c
 		}
 		captured := time.Now()
 		captureStarted := time.Now()
-		candidate, status, captureModel, err := e.probe(ctx, identity, model, targetProxyURL, upstreamProxyURL, "")
+		candidate, cookie, status, captureModel, err := e.mintAndConfirm(ctx, identity, model, targetProxyURL, upstreamProxyURL)
 		captureEgress := e.lookupEgressIP(ctx, targetProxyURL, upstreamProxyURL)
 		captureEvent := diagnosticEvent{AccountID: a.AccountID, Model: model, Stage: "capture", Attempt: attempt,
 			UpstreamProxy: upstreamProxyURL, TargetProxy: targetProxyURL, CaptureEgress: captureEgress,
@@ -203,6 +200,10 @@ func (e *Engine) collect(ctx context.Context, host pluginv1.HostServiceClient, c
 		if err != nil {
 			reason = "harvest_failed"
 			captureEvent.Outcome = "probe_failed"
+			if errors.Is(err, errMintRejected) {
+				reason = "unexpected_state_length"
+				captureEvent.Outcome = "unexpected_state"
+			}
 			captureEvent.Error = err.Error()
 			e.recordDiagnostic(captureEvent)
 			if isStopStatus(status) {
@@ -211,7 +212,7 @@ func (e *Engine) collect(ctx context.Context, host pluginv1.HostServiceClient, c
 			}
 			continue
 		}
-		if !validState(candidate, targetLength(a.Plan)) {
+		if !goodState(candidate) || cookie == "" {
 			reason = "unexpected_state_length"
 			captureEvent.Outcome = "unexpected_state"
 			e.recordDiagnostic(captureEvent)
@@ -247,7 +248,7 @@ func (e *Engine) collect(ctx context.Context, host pluginv1.HostServiceClient, c
 			e.recordDiagnostic(validationEvent)
 			continue
 		}
-		returned, status, validationModel, err := e.probe(ctx, fixed, model, fixedProxyURL, fixedUpstreamProxyURL, candidate)
+		returned, status, validationModel, err := e.probe(ctx, fixed, model, fixedProxyURL, fixedUpstreamProxyURL, candidate, cookie)
 		validationEvent.StateLength = len(returned)
 		validationEvent.StateClass = stateDiagnosticClass(returned)
 		validationEvent.ResponseModel = validationModel
@@ -271,7 +272,7 @@ func (e *Engine) collect(ctx context.Context, host pluginv1.HostServiceClient, c
 		}
 		validationEvent.Outcome = "accepted"
 		e.recordDiagnostic(validationEvent)
-		t := &ticket{AccountID: a.AccountID, Model: model, Plan: a.Plan, State: candidate, Version: randomID(), ConfigFingerprint: fp, FixedFingerprint: proxyFingerprint(fixedProxyURL), IdentityFingerprint: stableIdentity(fixed), CapturedAt: captured, ExpiresAt: captured.Add(time.Duration(c.TTLMinutes) * time.Minute)}
+		t := &ticket{AccountID: a.AccountID, Model: model, Plan: a.Plan, State: candidate, Cookie: cookie, Version: randomID(), ConfigFingerprint: fp, FixedFingerprint: proxyFingerprint(fixedProxyURL), IdentityFingerprint: stableIdentity(fixed), CapturedAt: captured, ExpiresAt: captured.Add(time.Duration(c.TTLMinutes) * time.Minute)}
 		if e.commit(ctx, host, c, a, model, k, gen, t, true) {
 			success = true
 			return
@@ -342,7 +343,7 @@ func (e *Engine) restore(ctx context.Context, host pluginv1.HostServiceClient, c
 	}
 	restoreStarted := time.Now()
 	fixedEgress := e.lookupEgressIP(ctx, targetProxyURL, upstreamProxyURL)
-	returned, status, responseModel, err := e.probe(ctx, identity, model, targetProxyURL, upstreamProxyURL, t.State)
+	returned, status, responseModel, err := e.probe(ctx, identity, model, targetProxyURL, upstreamProxyURL, t.State, t.Cookie)
 	event := diagnosticEvent{AccountID: a.AccountID, Model: model, Stage: "restore",
 		UpstreamProxy: upstreamProxyURL, TargetProxy: targetProxyURL,
 		FixedEgress: fixedEgress, StateLength: len(returned), StateClass: stateDiagnosticClass(returned),
@@ -392,76 +393,16 @@ func (e *Engine) commit(ctx context.Context, host pluginv1.HostServiceClient, c 
 	return true
 }
 
-func (e *Engine) probe(ctx context.Context, identity *pluginv1.ResolveOutboundIdentityResponse, model, proxyURL, upstreamProxyURL, state string) (string, int, string, error) {
+func (e *Engine) probe(ctx context.Context, identity *pluginv1.ResolveOutboundIdentityResponse, model, proxyURL, upstreamProxyURL, state, cookie string) (string, int, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	payload := map[string]any{"model": model, "store": false, "stream": true, "instructions": "Reply with exactly: pong", "input": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "ping"}}}}}
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.probeURL, bytes.NewReader(body))
-	if err != nil {
-		return "", 0, "", errors.New("probe construction failed")
-	}
-	for name, values := range identity.Headers {
-		if values == nil {
-			continue
-		}
-		for _, v := range values.Values {
-			req.Header.Add(name, v)
-		}
-	}
-	req.Header.Set("Authorization", "Bearer "+identity.Token)
-	req.Header.Del(StateHeader)
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Accept-Encoding", "identity")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("OpenAI-Beta", "responses=experimental")
-	req.Header.Set("session_id", randomID())
-	req.Header.Set("version", "0.153.4")
-	req.Header.Set("User-Agent", "codex_cli_rs/0.153.4")
-	req.Header.Set("originator", "codex_cli_rs")
-	if state != "" {
-		req.Header.Set(StateHeader, state)
-	}
-	req.Close = true
 	client, err := freshProbeClient(proxyURL, upstreamProxyURL)
 	if err != nil {
 		return "", 0, "", errors.New("probe transport unavailable")
 	}
 	defer client.CloseIdleConnections()
-	response, err := client.Do(req)
-	if err != nil {
-		return "", 0, "", errors.New("probe transport failed")
-	}
-	defer response.Body.Close()
-	status := response.StatusCode
-	if status != http.StatusOK {
-		return "", status, "", errors.New("probe request rejected")
-	}
-	observer := newCompletionObserver(model)
-	buf := make([]byte, 16*1024)
-	total := 0
-	for {
-		n, readErr := response.Body.Read(buf)
-		if n > 0 {
-			total += n
-			if total > 4*1024*1024 {
-				return "", status, observer.ActualModel(), errors.New("probe response too large")
-			}
-			observer.Write(buf[:n])
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return "", status, observer.ActualModel(), errors.New("probe response interrupted")
-		}
-	}
-	observer.Finish()
-	complete, matches := observer.Result()
-	if !complete || !matches {
-		return "", status, observer.ActualModel(), errors.New("probe did not complete with requested model")
-	}
-	return strings.TrimSpace(response.Header.Get(StateHeader)), status, observer.ActualModel(), nil
+	returned, _, actual, status, err := e.exchange(ctx, client, identity, model, state, cookie)
+	return returned, status, actual, err
 }
 
 var sidPattern = regexp.MustCompile(`(?i)(-sid-)[^-]+`)

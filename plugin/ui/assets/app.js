@@ -488,7 +488,7 @@
       byID('status-summary').textContent = status.message || (status.host_ready ? '状态已更新' : '等待宿主提供账号信息；可先保存配置。');
       statusAccountCatalog = status.account_catalog.slice();
       renderDetectedAccounts(status.account_ids);
-      byID('account-discovery').textContent = status.account_ids.length ? '发现 ' + status.account_ids.length + ' 个账号。名称、邮箱、到期时间和额度会从账号管理同步。' : '暂未发现账号，也可以手动填写 ID。宿主不会向此页面提供账号 Token。';
+      byID('account-discovery').textContent = status.account_ids.length ? '发现 ' + status.account_ids.length + ' 个账号。当前宿主只返回 ID，名称和邮箱请手填。' : '暂未发现账号，也可以手动填写 ID。宿主不会向此页面提供账号 Token。';
       const body = byID('tickets-body'); body.replaceChildren();
       status.tickets.forEach(function (ticket) {
         const id = accountID(ticket.account_id);
@@ -685,24 +685,12 @@
       try {
         if (!bridge) throw new Error('配置桥接未加载，请重新打开插件配置页。');
         bridge.ready();
-        let proxyLoadError = '';
-        let accountLoadError = '';
-        try {
-          proxies = normalizeProxies(await bridge.proxies());
-        } catch (error) {
-          proxyLoadError = error && error.message ? error.message : '无法读取 IP 管理代理列表。';
-        }
-        try {
-          hostAccountCatalog = normalizeAccountCatalog(await bridge.accounts());
-        } catch (error) {
-          accountLoadError = error && error.message ? error.message : '无法从账号管理同步账号信息。';
-        }
+        proxies = [];
+        hostAccountCatalog = [];
         const response = await bridge.load();
         if (closed) return;
         applyConfig(response.config); loaded = true; setBusy(false); resize();
         if (global.ResizeObserver) { resizeObserver = new global.ResizeObserver(resize); resizeObserver.observe(document.body); }
-        if (proxyLoadError) notice('无法读取 IP 管理代理列表：' + proxyLoadError, 'error');
-        else if (accountLoadError) notice('账号管理资料暂未同步，下拉将只显示账号 ID：' + accountLoadError, 'warning');
         await refreshStatus();
         if (!closed) pollTimer = global.setInterval(function () { if (document.visibilityState !== 'hidden') refreshStatus(); }, 10000);
       } catch (error) { if (!closed) { notice(error.message, 'error'); updateSaveState('配置未加载'); byID('connection-status').textContent = '连接失败'; } }

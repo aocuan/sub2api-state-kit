@@ -62,6 +62,7 @@ type ticket struct {
 	Model               string    `json:"model"`
 	Plan                string    `json:"plan"`
 	State               string    `json:"state"`
+	Cookie              string    `json:"cookie,omitempty"`
 	Version             string    `json:"version"`
 	ConfigFingerprint   string    `json:"config_fingerprint"`
 	FixedFingerprint    string    `json:"fixed_fingerprint"`
@@ -70,9 +71,9 @@ type ticket struct {
 	ExpiresAt           time.Time `json:"expires_at"`
 }
 type receipt struct {
-	State, Version, Key, ConfigFingerprint string
-	TargetProxyURL, UpstreamProxyURL       string
-	Generation                             uint64
+	State, Cookie, Version, Key, ConfigFingerprint string
+	TargetProxyURL, UpstreamProxyURL               string
+	Generation                                     uint64
 }
 type statusTicket struct {
 	AccountID        int64  `json:"account_id"`
@@ -333,7 +334,7 @@ func (e *Engine) ticketForRequest(_ context.Context, start *pluginv1.ForwardRequ
 
 	if !e.closed && e.hostReady && e.directory[start.AccountId] && validTicket(t, e.config, a, model, time.Now()) && t.FixedFingerprint == expectedFingerprint && t.IdentityFingerprint == stableHeaders(start.AccountId, start.Headers) && e.revoked[k] != t.Version {
 		return &receipt{
-			State: t.State, Version: t.Version, Key: k, ConfigFingerprint: t.ConfigFingerprint,
+			State: t.State, Cookie: t.Cookie, Version: t.Version, Key: k, ConfigFingerprint: t.ConfigFingerprint,
 			TargetProxyURL: targetProxyURL, UpstreamProxyURL: upstreamProxyURL, Generation: e.generation,
 		}, nil
 	}
@@ -341,7 +342,7 @@ func (e *Engine) ticketForRequest(_ context.Context, start *pluginv1.ForwardRequ
 	return nil, errors.New("verified STATE unavailable; acquisition is running in the background")
 }
 func validTicket(t *ticket, c Config, a AccountConfig, model string, now time.Time) bool {
-	return t != nil && t.AccountID == a.AccountID && t.Model == model && t.Plan == a.Plan && t.ConfigFingerprint == configFingerprint(c, a, model) && validState(t.State, targetLength(a.Plan)) && t.Version != "" && t.FixedFingerprint != "" && t.IdentityFingerprint != "" && !t.CapturedAt.IsZero() && !t.CapturedAt.After(now.Add(time.Minute)) && t.ExpiresAt.After(t.CapturedAt) && t.ExpiresAt.Sub(t.CapturedAt) <= time.Duration(c.TTLMinutes)*time.Minute && now.Before(t.ExpiresAt)
+	return t != nil && t.AccountID == a.AccountID && t.Model == model && t.Plan == a.Plan && t.ConfigFingerprint == configFingerprint(c, a, model) && goodState(t.State) && t.Cookie != "" && t.Version != "" && t.FixedFingerprint != "" && t.IdentityFingerprint != "" && !t.CapturedAt.IsZero() && !t.CapturedAt.After(now.Add(time.Minute)) && t.ExpiresAt.After(t.CapturedAt) && t.ExpiresAt.Sub(t.CapturedAt) <= time.Duration(c.TTLMinutes)*time.Minute && now.Before(t.ExpiresAt)
 }
 func (e *Engine) invalidate(r *receipt, reason string) {
 	if r == nil || (reason != "model_mismatch" && reason != "state_312") {

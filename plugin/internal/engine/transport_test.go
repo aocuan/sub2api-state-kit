@@ -94,7 +94,7 @@ func forwardingEngine(t *testing.T, enabled bool) *Engine {
 func addForwardTicket(e *Engine, proxy string) string {
 	state := "gAAAAA" + strings.Repeat("a", 286)
 	a := e.config.Accounts[0]
-	e.tickets[keyFor(7, "gpt-test")] = &ticket{AccountID: 7, Model: "gpt-test", Plan: "pro", State: state, Version: "test-version", ConfigFingerprint: configFingerprint(e.config, a, "gpt-test"), FixedFingerprint: proxyFingerprint(proxy), IdentityFingerprint: stableHeaders(7, nil), CapturedAt: time.Now().Add(-time.Minute), ExpiresAt: time.Now().Add(20 * time.Minute)}
+	e.tickets[keyFor(7, "gpt-test")] = &ticket{AccountID: 7, Model: "gpt-test", Plan: "pro", State: state, Cookie: "__cflb=cflb-test; __oailb=oailb-test", Version: "test-version", ConfigFingerprint: configFingerprint(e.config, a, "gpt-test"), FixedFingerprint: proxyFingerprint(proxy), IdentityFingerprint: stableHeaders(7, nil), CapturedAt: time.Now().Add(-time.Minute), ExpiresAt: time.Now().Add(20 * time.Minute)}
 	return state
 }
 
@@ -295,6 +295,9 @@ func TestForwardInjectsTicketAndInvalidatesOnModelMismatch(t *testing.T) {
 		values := r.Header.Values(StateHeader)
 		if len(values) != 1 || values[0] != state {
 			t.Error("ticket replacement failed")
+		}
+		if r.Header.Get("Cookie") != "__cflb=cflb-test; __oailb=oailb-test" {
+			t.Error("ticket cookie was not attached")
 		}
 		if values := r.Header.Values("Accept-Encoding"); len(values) != 1 || values[0] != "identity" {
 			t.Error("ticket response did not negotiate inspectable uncompressed bytes")
