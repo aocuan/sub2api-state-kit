@@ -15,9 +15,9 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugin"
-VERSION = "0.3.7"
+VERSION = "0.3.7-fenjue.1"
 PLUGIN_ID = "io.github.wangyunjeff.sub2api-state-kit"
-KEY_ID = "state-kit-local-v1"
+KEY_ID = "state-kit-aocuan-v1"
 PLATFORMS = ("linux-amd64", "linux-arm64", "darwin-arm64")
 
 
